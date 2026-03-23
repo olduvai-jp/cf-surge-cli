@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cfsurge CLI Release"
+  short_description: "Install and use a standalone CLI to publish a static site"
+  default_prompt: "Use $cfsurge-cli-release when a user wants to install or use a standalone CLI to log in, configure a project, publish a local static site directory, list projects, remove a project, or log out. This skill is for the GitHub Releases zip distribution of cfsurge. Stay in standalone binary mode, ask for apiBase when needed, and give OS-specific commands for macOS, Linux, or Windows."
