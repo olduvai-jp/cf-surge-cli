@@ -96,7 +96,7 @@ cfsurge publish dist --slug my-site
 ## コマンド一覧
 
 ```text
-login [--api-base <url>] [--token <token>]
+login [--api-base <url>] [--token <token>] [--token-storage <file|keychain>]
 init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]
 publish [dir] [--slug <slug>]
 --version
@@ -104,6 +104,8 @@ list
 remove [slug]
 logout
 ```
+
+`login` の既定保存先は `file` で、`--token-storage keychain` を明示した場合のみ macOS Keychain を利用します。
 
 `list` は TSV 形式で 1 行ずつ出力します。
 

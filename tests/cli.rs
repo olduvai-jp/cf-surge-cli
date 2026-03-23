@@ -249,6 +249,46 @@ fn login_verifies_token_and_writes_config() {
 }
 
 #[test]
+fn login_fails_when_keychain_storage_is_unavailable() {
+    let home = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("GET", "/v1/meta") => StubResponse::json(&format!(
+                r#"{{"apiBase":"{}","publicSuffix":"example.test","tokenCreationUrl":null}}"#,
+                api_base
+            )),
+            ("POST", "/v1/auth/verify") => {
+                StubResponse::json(r#"{"actor":"cf-token:keychain-unavailable"}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    let result = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--token",
+            "token-keychain",
+            "--token-storage",
+            "keychain",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+
+    assert_eq!(result.code, 1, "{}", result.stderr);
+    assert!(
+        result
+            .stderr
+            .contains("macOS Keychain is unavailable. Run cfsurge login with --token-storage file.")
+    );
+    assert!(!config_path_for_home(home.path()).exists());
+}
+
+#[test]
 fn login_prompts_for_api_base_when_unset() {
     let home = TempDir::new().unwrap();
     let server = start_stub_server(move |api_base, request| {

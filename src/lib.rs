@@ -160,6 +160,7 @@ fn login(args: &[String]) -> Result<(), String> {
     let token_from_env = env::var("CFSURGE_TOKEN")
         .ok()
         .and_then(|value| read_string(&value));
+    let requested_token_storage = parse_token_storage_input(read_flag(args, "--token-storage"))?;
     print_token_creation_hint_if_needed(
         token_from_flag.as_deref(),
         token_from_env.as_deref(),
@@ -184,7 +185,8 @@ fn login(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    let token_storage = persist_token(&token)?;
+    let requested_token_storage = requested_token_storage.unwrap_or(TokenStorage::File);
+    let token_storage = persist_token(&token, requested_token_storage)?;
     write_config_file(&StoredConfig {
         api_base,
         token_storage: Some(token_storage.clone()),
@@ -630,18 +632,18 @@ fn read_token(config: &StoredConfig) -> Result<String, String> {
     }
 }
 
-fn persist_token(token: &str) -> Result<TokenStorage, String> {
-    if !can_use_mac_keychain() {
-        return Ok(TokenStorage::File);
-    }
-    match write_token_to_mac_keychain(token) {
-        Ok(()) => Ok(TokenStorage::Keychain),
-        Err(error) => {
-            eprintln!(
-                "warning: failed to store token in macOS Keychain ({}), falling back to config file storage",
-                error
-            );
-            Ok(TokenStorage::File)
+fn persist_token(token: &str, token_storage: TokenStorage) -> Result<TokenStorage, String> {
+    match token_storage {
+        TokenStorage::File => Ok(TokenStorage::File),
+        TokenStorage::Keychain => {
+            if !can_use_mac_keychain() {
+                return Err(
+                    "macOS Keychain is unavailable. Run cfsurge login with --token-storage file."
+                        .into(),
+                );
+            }
+            write_token_to_mac_keychain(token)?;
+            Ok(TokenStorage::Keychain)
         }
     }
 }
@@ -860,6 +862,20 @@ fn parse_visibility_input(value: &str) -> Result<Visibility, String> {
         .ok_or_else(|| "invalid visibility: expected public or unlisted".into())
 }
 
+fn parse_token_storage_input(
+    value: Option<String>,
+) -> Result<Option<TokenStorage>, String> {
+    let value = match value {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "file" => Ok(Some(TokenStorage::File)),
+        "keychain" => Ok(Some(TokenStorage::Keychain)),
+        _ => Err("invalid token storage: expected file or keychain".into()),
+    }
+}
+
 fn normalize_api_base(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1014,7 +1030,7 @@ fn read_stdin_line() -> Result<String, String> {
 
 fn print_help() {
     print!(
-        "cfsurge commands:\n  login [--api-base <url>] [--token <token>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  logout\n"
+        "cfsurge commands:\n  login [--api-base <url>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  logout\n"
     );
 }
 
