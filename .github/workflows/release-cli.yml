@@ -1,0 +1,119 @@
+name: release-cli
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: darwin-arm64
+            bin: cfsurge
+            zip: cfsurge-darwin-arm64.zip
+          - os: ubuntu-latest
+            target: linux-x64
+            bin: cfsurge
+            zip: cfsurge-linux-x64.zip
+          - os: windows-latest
+            target: windows-x64
+            bin: cfsurge.exe
+            zip: cfsurge-windows-x64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        env:
+          CFSURGE_CLI_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '0.0.0-dev' }}
+        run: cargo build --release
+
+      - name: Validate injected version
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '0.0.0-dev' }}"
+          actual="$(./target/release/${{ matrix.bin }} --version | tr -d '\r\n')"
+          test "${actual}" = "${expected}"
+
+      - name: Smoke check --help
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/${{ matrix.bin }} --help >/dev/null
+
+      - name: Package zip and checksum
+        shell: pwsh
+        run: |
+          $zipName = "${{ matrix.zip }}"
+          $binary = Join-Path "target/release" "${{ matrix.bin }}"
+          if (Test-Path $zipName) {
+            Remove-Item -Force $zipName
+          }
+          Compress-Archive -Path $binary -DestinationPath $zipName -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 $zipName).Hash.ToLower()
+          Set-Content -Path "$zipName.sha256" -Value "$hash  $zipName"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfsurge-${{ matrix.target }}
+          path: |
+            ${{ matrix.zip }}
+            ${{ matrix.zip }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish-release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cfsurge-*
+          merge-multiple: true
+
+      - name: Validate assets and build SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid release tag: ${GITHUB_REF_NAME} (expected vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+          test -f cfsurge-darwin-arm64.zip
+          test -f cfsurge-linux-x64.zip
+          test -f cfsurge-windows-x64.zip
+          test -f cfsurge-darwin-arm64.zip.sha256
+          test -f cfsurge-linux-x64.zip.sha256
+          test -f cfsurge-windows-x64.zip.sha256
+          cat cfsurge-*.zip.sha256 > SHA256SUMS
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cfsurge-darwin-arm64.zip
+            cfsurge-linux-x64.zip
+            cfsurge-windows-x64.zip
+            SHA256SUMS
