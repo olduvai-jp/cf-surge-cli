@@ -1,3 +1,9 @@
+use crossterm::ExecutableCommand;
+use crossterm::cursor::MoveUp;
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
+use crossterm::terminal::{
+    Clear, ClearType, disable_raw_mode, enable_raw_mode, is_raw_mode_enabled,
+};
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -12,6 +18,7 @@ use walkdir::WalkDir;
 
 const SITE_CONFIG_FILE_NAME: &str = ".cfsurge.json";
 const GENERIC_TOKEN_DASHBOARD_URL: &str = "https://dash.cloudflare.com/profile/api-tokens";
+const API_BASE_PROMPT_GUIDANCE: &str = "Enter API base URL (for example: https://api.example.com)";
 const DEV_CLI_VERSION: &str = "0.0.0-dev";
 const KEYCHAIN_SERVICE: &str = "cfsurge";
 const KEYCHAIN_ACCOUNT: &str = "api-token";
@@ -31,7 +38,7 @@ struct StoredConfig {
     token: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum TokenStorage {
     Keychain,
@@ -84,6 +91,12 @@ struct PrepareResponse {
 struct UploadUrl {
     path: String,
     url: String,
+}
+
+struct SelectOption<T> {
+    value: T,
+    label: &'static str,
+    description: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -170,6 +183,7 @@ fn login(args: &[String]) -> Result<(), String> {
         Some(token) => token,
         None => prompt("Cloudflare API token")?,
     };
+    let token_storage_preference = resolve_token_storage_preference(requested_token_storage)?;
 
     let client = Client::new();
     let response = client
@@ -185,11 +199,10 @@ fn login(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    let requested_token_storage = requested_token_storage.unwrap_or(TokenStorage::File);
-    let token_storage = persist_token(&token, requested_token_storage)?;
+    let token_storage = persist_token(&token, token_storage_preference)?;
     write_config_file(&StoredConfig {
         api_base,
-        token_storage: Some(token_storage.clone()),
+        token_storage: Some(token_storage),
         token: if token_storage == TokenStorage::File {
             Some(token)
         } else {
@@ -216,50 +229,25 @@ fn init(args: &[String]) -> Result<(), String> {
     let existing = read_site_config_if_exists()?;
     let reserved_labels = build_reserved_labels(Some(api_base.as_str()), metadata.as_ref());
 
-    let slug = match read_flag(args, "--slug") {
-        Some(value) => value,
-        None => prompt_with_default(
-            "Project slug",
-            existing.as_ref().map(|item| item.slug.as_str()),
-        )?,
-    };
-    assert_valid_slug(&slug, &reserved_labels)?;
-
-    let publish_dir = match read_flag(args, "--publish-dir") {
-        Some(value) => value,
-        None => prompt_with_default(
-            "Publish directory",
-            Some(
-                existing
-                    .as_ref()
-                    .map(|item| item.publish_dir.as_str())
-                    .unwrap_or("."),
-            ),
-        )?,
-    };
-    if publish_dir.trim().is_empty() {
-        return Err("publish directory cannot be empty".into());
-    }
-
-    let visibility_input = if let Some(value) = read_flag(args, "--visibility") {
-        value
-    } else if io::stdin().is_terminal() {
-        prompt_with_default(
-            "Visibility",
-            Some(
-                existing
-                    .as_ref()
-                    .map(|item| item.visibility.as_str())
-                    .unwrap_or(DEFAULT_VISIBILITY.as_str()),
-            ),
-        )?
-    } else {
+    let slug = resolve_slug(
+        args,
+        existing.as_ref().map(|item| item.slug.as_str()),
+        &reserved_labels,
+    )?;
+    let publish_dir = resolve_publish_dir(
+        args,
         existing
             .as_ref()
-            .map(|item| item.visibility.as_str().to_string())
-            .unwrap_or_else(|| DEFAULT_VISIBILITY.as_str().to_string())
-    };
-    let visibility = parse_visibility_input(&visibility_input)?;
+            .map(|item| item.publish_dir.as_str())
+            .unwrap_or("."),
+    )?;
+    let visibility = resolve_visibility(
+        args,
+        existing
+            .as_ref()
+            .map(|item| item.visibility)
+            .unwrap_or(DEFAULT_VISIBILITY),
+    )?;
 
     write_site_config(&SiteConfig {
         slug: slug.clone(),
@@ -812,6 +800,10 @@ fn fetch_api_metadata(api_base: &str) -> Option<ApiMetadata> {
     response.json::<ApiMetadata>().ok()
 }
 
+fn is_interactive_prompt_session() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
 fn resolve_api_base(args: &[String], stored_api_base: Option<&str>) -> Result<String, String> {
     if let Some(value) = read_flag(args, "--api-base") {
         return normalize_api_base(&value);
@@ -825,7 +817,97 @@ fn resolve_api_base(args: &[String], stored_api_base: Option<&str>) -> Result<St
     if let Some(value) = stored_api_base {
         return normalize_api_base(value);
     }
-    normalize_api_base(&prompt("API base URL")?)
+    if is_interactive_prompt_session() {
+        println!("{API_BASE_PROMPT_GUIDANCE}");
+    }
+    prompt_until_valid("API base URL", normalize_api_base)
+}
+
+fn resolve_slug(
+    args: &[String],
+    default_slug: Option<&str>,
+    reserved_labels: &[String],
+) -> Result<String, String> {
+    if let Some(value) = read_flag(args, "--slug") {
+        return parse_slug_input(&value, reserved_labels);
+    }
+    if is_interactive_prompt_session() {
+        println!("Project slug is used as hostname label (a-z, 0-9, hyphen).");
+    }
+    prompt_with_default_until_valid("Project slug", default_slug, |value| {
+        parse_slug_input(value, reserved_labels)
+    })
+}
+
+fn resolve_publish_dir(args: &[String], default_publish_dir: &str) -> Result<String, String> {
+    if let Some(value) = read_flag(args, "--publish-dir") {
+        return parse_publish_dir_input(&value);
+    }
+    if is_interactive_prompt_session() {
+        println!("Publish directory is relative to the current working directory.");
+    }
+    prompt_with_default_until_valid(
+        "Publish directory",
+        Some(default_publish_dir),
+        parse_publish_dir_input,
+    )
+}
+
+fn resolve_visibility(
+    args: &[String],
+    default_visibility: Visibility,
+) -> Result<Visibility, String> {
+    if let Some(value) = read_flag(args, "--visibility") {
+        return parse_visibility_input(&value);
+    }
+    if !is_interactive_prompt_session() {
+        return Ok(default_visibility);
+    }
+
+    prompt_select(
+        "Visibility",
+        &[
+            SelectOption {
+                value: Visibility::Public,
+                label: "public",
+                description: "Published at https://<slug>.<publicSuffix>",
+            },
+            SelectOption {
+                value: Visibility::Unlisted,
+                label: "unlisted",
+                description: "Published at unlisted host with a share token",
+            },
+        ],
+        default_visibility,
+    )
+}
+
+fn resolve_token_storage_preference(
+    requested_token_storage: Option<TokenStorage>,
+) -> Result<TokenStorage, String> {
+    if let Some(value) = requested_token_storage {
+        return Ok(value);
+    }
+    if !is_interactive_prompt_session() {
+        return Ok(TokenStorage::File);
+    }
+
+    prompt_select(
+        "Token storage",
+        &[
+            SelectOption {
+                value: TokenStorage::File,
+                label: "file",
+                description: "Store token in ~/.config/cfsurge/config.json",
+            },
+            SelectOption {
+                value: TokenStorage::Keychain,
+                label: "keychain",
+                description: "Store token in macOS Keychain (fails on non-macOS)",
+            },
+        ],
+        TokenStorage::File,
+    )
 }
 
 fn print_token_creation_hint_if_needed(
@@ -862,9 +944,21 @@ fn parse_visibility_input(value: &str) -> Result<Visibility, String> {
         .ok_or_else(|| "invalid visibility: expected public or unlisted".into())
 }
 
-fn parse_token_storage_input(
-    value: Option<String>,
-) -> Result<Option<TokenStorage>, String> {
+fn parse_slug_input(value: &str, reserved_labels: &[String]) -> Result<String, String> {
+    let slug = value.trim();
+    assert_valid_slug(slug, reserved_labels)?;
+    Ok(slug.to_string())
+}
+
+fn parse_publish_dir_input(value: &str) -> Result<String, String> {
+    let publish_dir = value.trim();
+    if publish_dir.is_empty() {
+        return Err("publish directory cannot be empty".into());
+    }
+    Ok(publish_dir.to_string())
+}
+
+fn parse_token_storage_input(value: Option<String>) -> Result<Option<TokenStorage>, String> {
     let value = match value {
         Some(value) => value,
         None => return Ok(None),
@@ -1003,6 +1097,20 @@ fn prompt(label: &str) -> Result<String, String> {
     read_stdin_line()
 }
 
+fn prompt_until_valid<T, F>(label: &str, parse: F) -> Result<T, String>
+where
+    F: Fn(&str) -> Result<T, String>,
+{
+    loop {
+        let value = prompt(label)?;
+        match parse(&value) {
+            Ok(parsed) => return Ok(parsed),
+            Err(error) if is_interactive_prompt_session() => eprintln!("{error}"),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn prompt_with_default(label: &str, default_value: Option<&str>) -> Result<String, String> {
     let prompt_label = match default_value {
         Some(value) if !value.is_empty() => format!("{label} [{value}]"),
@@ -1020,6 +1128,169 @@ fn prompt_with_default(label: &str, default_value: Option<&str>) -> Result<Strin
     Err(format!("{label} is required"))
 }
 
+fn prompt_with_default_until_valid<T, F>(
+    label: &str,
+    default_value: Option<&str>,
+    parse: F,
+) -> Result<T, String>
+where
+    F: Fn(&str) -> Result<T, String>,
+{
+    loop {
+        let value = prompt_with_default(label, default_value)?;
+        match parse(&value) {
+            Ok(parsed) => return Ok(parsed),
+            Err(error) if is_interactive_prompt_session() => eprintln!("{error}"),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn prompt_select<T>(label: &str, options: &[SelectOption<T>], default_value: T) -> Result<T, String>
+where
+    T: Copy + PartialEq,
+{
+    if !is_interactive_prompt_session() {
+        return Ok(default_value);
+    }
+    if options.is_empty() {
+        return Err(format!("select options are required for {label}"));
+    }
+
+    let mut stdout = io::stdout().lock();
+    let mut selected_index = options
+        .iter()
+        .position(|option| option.value == default_value)
+        .unwrap_or(0);
+    let mut rendered_line_count = 0u16;
+    let was_raw_mode_enabled = is_raw_mode_enabled().map_err(|error| error.to_string())?;
+
+    if !was_raw_mode_enabled {
+        enable_raw_mode().map_err(|error| error.to_string())?;
+    }
+    let selection_result = (|| {
+        render_select(
+            &mut stdout,
+            label,
+            options,
+            selected_index,
+            &mut rendered_line_count,
+        )?;
+        loop {
+            let event = read().map_err(|error| error.to_string())?;
+            let Event::Key(key_event) = event else {
+                continue;
+            };
+            if matches!(key_event.kind, KeyEventKind::Release) {
+                continue;
+            }
+            match key_event.code {
+                KeyCode::Up => {
+                    selected_index = if selected_index == 0 {
+                        options.len() - 1
+                    } else {
+                        selected_index - 1
+                    };
+                    render_select(
+                        &mut stdout,
+                        label,
+                        options,
+                        selected_index,
+                        &mut rendered_line_count,
+                    )?;
+                }
+                KeyCode::Down => {
+                    selected_index = (selected_index + 1) % options.len();
+                    render_select(
+                        &mut stdout,
+                        label,
+                        options,
+                        selected_index,
+                        &mut rendered_line_count,
+                    )?;
+                }
+                KeyCode::Enter => break Ok(options[selected_index].value),
+                KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Err("interrupted".into());
+                }
+                _ => {}
+            }
+        }
+    })();
+    if !was_raw_mode_enabled {
+        disable_raw_mode().map_err(|error| error.to_string())?;
+    }
+
+    if let Ok(selected_value) = selection_result {
+        let selected_label = options
+            .iter()
+            .find(|option| option.value == selected_value)
+            .map(|option| option.label)
+            .unwrap_or(options[0].label);
+        clear_rendered_select(&mut stdout, rendered_line_count)?;
+        writeln!(stdout, "{label}: {selected_label}").map_err(|error| error.to_string())?;
+        stdout.flush().map_err(|error| error.to_string())?;
+        return Ok(selected_value);
+    }
+
+    selection_result
+}
+
+fn render_select<W, T>(
+    stdout: &mut W,
+    label: &str,
+    options: &[SelectOption<T>],
+    selected_index: usize,
+    rendered_line_count: &mut u16,
+) -> Result<(), String>
+where
+    W: Write,
+{
+    if *rendered_line_count > 0 {
+        stdout
+            .execute(MoveUp(*rendered_line_count))
+            .map_err(|error| error.to_string())?;
+    }
+    write!(stdout, "{label} (Use ↑/↓, Enter to confirm)\r\n").map_err(|error| error.to_string())?;
+    for (index, option) in options.iter().enumerate() {
+        stdout
+            .execute(Clear(ClearType::CurrentLine))
+            .map_err(|error| error.to_string())?;
+        let marker = if index == selected_index { ">" } else { " " };
+        write!(
+            stdout,
+            "\r{marker} {} - {}\r\n",
+            option.label, option.description
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    stdout.flush().map_err(|error| error.to_string())?;
+    *rendered_line_count = (options.len() + 1) as u16;
+    Ok(())
+}
+
+fn clear_rendered_select<W>(stdout: &mut W, rendered_line_count: u16) -> Result<(), String>
+where
+    W: Write,
+{
+    if rendered_line_count == 0 {
+        return Ok(());
+    }
+    stdout
+        .execute(MoveUp(rendered_line_count))
+        .map_err(|error| error.to_string())?;
+    for _ in 0..rendered_line_count {
+        stdout
+            .execute(Clear(ClearType::CurrentLine))
+            .map_err(|error| error.to_string())?;
+        write!(stdout, "\r\n").map_err(|error| error.to_string())?;
+    }
+    stdout
+        .execute(MoveUp(rendered_line_count))
+        .map_err(|error| error.to_string())?;
+    stdout.flush().map_err(|error| error.to_string())
+}
+
 fn read_stdin_line() -> Result<String, String> {
     let mut input = String::new();
     io::stdin()
@@ -1030,7 +1301,7 @@ fn read_stdin_line() -> Result<String, String> {
 
 fn print_help() {
     print!(
-        "cfsurge commands:\n  login [--api-base <url>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  logout\n"
+        "cfsurge commands:\n  login [--api-base <url>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  logout\n  interactive choices: use ↑/↓ and Enter\n"
     );
 }
 
@@ -1127,7 +1398,7 @@ fn format_http_error(error: reqwest::Error) -> String {
 mod tests {
     use super::{
         ApiMetadata, FALLBACK_API_RESERVED_LABEL, assert_valid_slug, build_reserved_labels,
-        normalize_api_base,
+        normalize_api_base, parse_publish_dir_input,
     };
 
     #[test]
@@ -1182,5 +1453,11 @@ mod tests {
         let reserved = vec!["api".to_string(), "www".to_string()];
         let error = assert_valid_slug("api", &reserved).expect_err("reserved slug must fail");
         assert_eq!(error, "invalid slug: api (reserved_slug)");
+    }
+
+    #[test]
+    fn parse_publish_dir_input_rejects_empty_string() {
+        let error = parse_publish_dir_input("   ").expect_err("empty publish dir must fail");
+        assert_eq!(error, "publish directory cannot be empty");
     }
 }

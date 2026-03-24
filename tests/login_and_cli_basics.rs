@@ -199,6 +199,7 @@ fn help_output_includes_version_flag() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--version"));
+    assert!(stdout.contains("interactive choices: use"));
 }
 
 #[test]
@@ -325,6 +326,23 @@ fn login_prompts_for_api_base_when_not_configured() {
     assert!(stdout.contains("API base URL: "));
     assert!(stdout.contains("logged in as cf-token:prompted-api"));
 
+    let config: Value = serde_json::from_str(
+        &fs::read_to_string(config_path_for_home(temp_home.path())).expect("read config"),
+    )
+    .expect("parse config");
+    assert_eq!(
+        config.get("apiBase").and_then(Value::as_str),
+        Some(server.api_base.as_str())
+    );
+    assert_eq!(
+        config.get("tokenStorage").and_then(Value::as_str),
+        Some("file")
+    );
+    assert_eq!(
+        config.get("token").and_then(Value::as_str),
+        Some("token-from-flag")
+    );
+
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].url, "/v1/meta");
@@ -399,6 +417,23 @@ fn login_without_token_uses_metadata_token_creation_url() {
     assert!(stdout.contains("https://dash.cloudflare.com/profile/api-tokens?foo=bar"));
     assert!(stdout.contains("Cloudflare API token: "));
     assert!(stdout.contains("logged in as cf-token:prompt"));
+
+    let config: Value = serde_json::from_str(
+        &fs::read_to_string(config_path_for_home(temp_home.path())).expect("read config"),
+    )
+    .expect("parse config");
+    assert_eq!(
+        config.get("apiBase").and_then(Value::as_str),
+        Some(server.api_base.as_str())
+    );
+    assert_eq!(
+        config.get("tokenStorage").and_then(Value::as_str),
+        Some("file")
+    );
+    assert_eq!(
+        config.get("token").and_then(Value::as_str),
+        Some("token-from-prompt")
+    );
 }
 
 #[test]

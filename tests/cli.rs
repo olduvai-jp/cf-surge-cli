@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -169,6 +170,73 @@ fn write_config(home: &Path, config: &str) {
     fs::write(config_path, config).unwrap();
 }
 
+#[cfg(target_os = "macos")]
+fn create_fake_security_command(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = root.join("bin");
+    let store_path = root.join("fake-keychain-token.txt");
+    let log_path = root.join("fake-keychain.log");
+    let script_path = bin_dir.join("security");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+cmd="${1:-}"
+if [ -n "${FAKE_SECURITY_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "${FAKE_SECURITY_LOG}"
+fi
+
+if [ "$cmd" = "help" ]; then
+  exit 0
+fi
+
+if [ -z "${FAKE_SECURITY_STORE:-}" ]; then
+  echo "missing FAKE_SECURITY_STORE" >&2
+  exit 2
+fi
+
+case "$cmd" in
+  add-generic-password)
+    token=""
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "-w" ]; then
+        shift
+        token="${1:-}"
+        break
+      fi
+      shift
+    done
+    printf '%s' "$token" > "${FAKE_SECURITY_STORE}"
+    ;;
+  find-generic-password)
+    if [ ! -f "${FAKE_SECURITY_STORE}" ]; then
+      echo "The specified item could not be found in the keychain" >&2
+      exit 44
+    fi
+    cat "${FAKE_SECURITY_STORE}"
+    ;;
+  delete-generic-password)
+    if [ ! -f "${FAKE_SECURITY_STORE}" ]; then
+      echo "The specified item could not be found in the keychain" >&2
+      exit 44
+    fi
+    rm -f "${FAKE_SECURITY_STORE}"
+    ;;
+  *)
+    echo "unsupported fake security command" >&2
+    exit 1
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).unwrap();
+    (bin_dir, store_path, log_path)
+}
+
 fn create_site_directory(root: &Path, relative_dir: &str) -> PathBuf {
     let site_dir = root.join(relative_dir);
     fs::create_dir_all(&site_dir).unwrap();
@@ -198,6 +266,7 @@ fn help_output_includes_version() {
     assert_eq!(result.code, 0);
     assert_eq!(result.stderr, "");
     assert!(result.stdout.contains("--version"));
+    assert!(result.stdout.contains("interactive choices: use"));
 }
 
 #[test]
@@ -248,6 +317,59 @@ fn login_verifies_token_and_writes_config() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn login_defaults_to_file_storage_even_when_keychain_is_available() {
+    let home = TempDir::new().unwrap();
+    let fake_security_root = TempDir::new().unwrap();
+    let (bin_dir, store_path, log_path) = create_fake_security_command(fake_security_root.path());
+    let path_value = match env::var("PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{}:{existing}", bin_dir.display()),
+        _ => bin_dir.display().to_string(),
+    };
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("GET", "/v1/meta") => StubResponse::json(&format!(
+                r#"{{"apiBase":"{}","publicSuffix":"example.test","tokenCreationUrl":null}}"#,
+                api_base
+            )),
+            ("POST", "/v1/auth/verify") => {
+                StubResponse::json(r#"{"actor":"cf-token:file-default"}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    let result = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--token",
+            "token-file-default",
+        ],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", &path_value),
+            ("FAKE_SECURITY_STORE", store_path.to_str().unwrap()),
+            ("FAKE_SECURITY_LOG", log_path.to_str().unwrap()),
+        ],
+        "",
+        None,
+    );
+
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(result.stderr, "");
+    assert_eq!(result.stdout, "logged in as cf-token:file-default\n");
+
+    let config = fs::read_to_string(config_path_for_home(home.path())).unwrap();
+    assert!(config.contains(r#""tokenStorage": "file""#));
+    assert!(config.contains(r#""token": "token-file-default""#));
+    assert!(!store_path.exists());
+    assert!(!log_path.exists());
+}
+
 #[test]
 fn login_fails_when_keychain_storage_is_unavailable() {
     let home = TempDir::new().unwrap();
@@ -281,11 +403,101 @@ fn login_fails_when_keychain_storage_is_unavailable() {
 
     assert_eq!(result.code, 1, "{}", result.stderr);
     assert!(
-        result
-            .stderr
-            .contains("macOS Keychain is unavailable. Run cfsurge login with --token-storage file.")
+        result.stderr.contains(
+            "macOS Keychain is unavailable. Run cfsurge login with --token-storage file."
+        )
     );
     assert!(!config_path_for_home(home.path()).exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn login_stores_token_in_keychain_when_explicitly_requested_and_list_reads_it() {
+    let home = TempDir::new().unwrap();
+    let fake_security_root = TempDir::new().unwrap();
+    let (bin_dir, store_path, log_path) = create_fake_security_command(fake_security_root.path());
+    let path_value = match env::var("PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{}:{existing}", bin_dir.display()),
+        _ => bin_dir.display().to_string(),
+    };
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("GET", "/v1/meta") => StubResponse::json(&format!(
+                r#"{{"apiBase":"{}","publicSuffix":"example.test","tokenCreationUrl":null}}"#,
+                api_base
+            )),
+            ("POST", "/v1/auth/verify") => StubResponse::json(r#"{"actor":"cf-token:keychain"}"#),
+            ("GET", "/v1/projects") => StubResponse::json(
+                r#"{"projects":[{"slug":"site-a","visibility":"public","servedUrl":"https://site-a.example.test","activeDeploymentId":"dep-1","updatedAt":"2026-03-24T00:00:00.000Z","updatedBy":"cf-token:keychain"}]}"#,
+            ),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    let login_result = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--token",
+            "token-keychain",
+            "--token-storage",
+            "keychain",
+        ],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", &path_value),
+            ("FAKE_SECURITY_STORE", store_path.to_str().unwrap()),
+            ("FAKE_SECURITY_LOG", log_path.to_str().unwrap()),
+        ],
+        "",
+        None,
+    );
+
+    assert_eq!(login_result.code, 0, "{}", login_result.stderr);
+    assert_eq!(login_result.stderr, "");
+    assert_eq!(login_result.stdout, "logged in as cf-token:keychain\n");
+
+    let config = fs::read_to_string(config_path_for_home(home.path())).unwrap();
+    assert!(config.contains(r#""tokenStorage": "keychain""#));
+    assert!(!config.contains(r#""token":"#));
+    assert_eq!(fs::read_to_string(&store_path).unwrap(), "token-keychain");
+
+    let list_result = run_cli(
+        &["list"],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", &path_value),
+            ("FAKE_SECURITY_STORE", store_path.to_str().unwrap()),
+            ("FAKE_SECURITY_LOG", log_path.to_str().unwrap()),
+        ],
+        "",
+        None,
+    );
+
+    assert_eq!(list_result.code, 0, "{}", list_result.stderr);
+    assert_eq!(list_result.stderr, "");
+    assert!(
+        list_result.stdout.contains(
+            "site-a\tpublic\thttps://site-a.example.test\tdep-1\t2026-03-24T00:00:00.000Z\tcf-token:keychain"
+        )
+    );
+
+    let requests = server.recorded();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1].authorization.as_deref(),
+        Some("Bearer token-keychain")
+    );
+    assert_eq!(
+        requests[2].authorization.as_deref(),
+        Some("Bearer token-keychain")
+    );
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("add-generic-password"));
+    assert!(log.contains("find-generic-password"));
 }
 
 #[test]
@@ -315,6 +527,11 @@ fn login_prompts_for_api_base_when_unset() {
     assert_eq!(result.stderr, "");
     assert!(result.stdout.contains("API base URL: "));
     assert!(result.stdout.contains("logged in as cf-token:prompted-api"));
+
+    let config = fs::read_to_string(config_path_for_home(home.path())).unwrap();
+    assert!(config.contains(&format!(r#""apiBase": "{}""#, server.api_base)));
+    assert!(config.contains(r#""tokenStorage": "file""#));
+    assert!(config.contains(r#""token": "token-from-flag""#));
 }
 
 #[test]
