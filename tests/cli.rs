@@ -1143,10 +1143,11 @@ fn init_prompts_for_api_base_and_writes_site_config() {
     assert_eq!(result.stderr, "");
     assert!(result.stdout.contains("API base URL: "));
     assert!(result.stdout.contains("saved .cfsurge.json"));
+    assert!(result.stdout.contains("next step: run \"cfsurge publish\" to deploy this site"));
     assert!(
         result
             .stdout
-            .contains("public URL preview: https://my-site.example.test")
+            .contains("public URL (after publish): https://my-site.example.test")
     );
 
     let site_config = fs::read_to_string(site_config_path_for_dir(project.path())).unwrap();
@@ -1188,10 +1189,11 @@ fn init_stores_unlisted_visibility_and_prints_preview() {
 
     assert_eq!(result.code, 0, "{}", result.stderr);
     assert_eq!(result.stderr, "");
+    assert!(result.stdout.contains("next step: run \"cfsurge publish\" to deploy this site"));
     assert!(
         result
             .stdout
-            .contains("unlisted URL preview: https://u.example.test/<share-token>/")
+            .contains("unlisted URL pattern (after publish): https://u.example.test/<share-token>/")
     );
     let site_config = fs::read_to_string(site_config_path_for_dir(project.path())).unwrap();
     assert!(site_config.contains(r#""visibility": "unlisted""#));
@@ -1226,6 +1228,7 @@ fn init_still_saves_site_config_when_metadata_is_unavailable() {
     assert_eq!(result.code, 0, "{}", result.stderr);
     assert_eq!(result.stderr, "");
     assert!(result.stdout.contains("saved .cfsurge.json"));
+    assert!(result.stdout.contains("next step: run \"cfsurge publish\" to deploy this site"));
     assert!(!result.stdout.contains("public URL preview"));
 
     let site_config = fs::read_to_string(site_config_path_for_dir(project.path())).unwrap();

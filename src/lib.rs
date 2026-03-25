@@ -376,18 +376,19 @@ fn init(args: &[String]) -> Result<(), String> {
     })?;
 
     println!("saved {SITE_CONFIG_FILE_NAME}");
+    println!("next step: run \"cfsurge publish\" to deploy this site");
     if visibility == Visibility::Public {
         if let Some(public_suffix) = metadata
             .as_ref()
             .and_then(|item| read_string_opt(item.public_suffix.as_ref()))
         {
-            println!("public URL preview: https://{slug}.{public_suffix}");
+            println!("public URL (after publish): https://{slug}.{public_suffix}");
         }
     } else if let Some(unlisted_host) = metadata
         .as_ref()
         .and_then(|item| read_string_opt(item.unlisted_host.as_ref()))
     {
-        println!("unlisted URL preview: https://{unlisted_host}/<share-token>/");
+        println!("unlisted URL pattern (after publish): https://{unlisted_host}/<share-token>/");
     }
 
     Ok(())
