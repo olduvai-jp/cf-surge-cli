@@ -272,6 +272,11 @@ fn help_output_includes_version() {
     assert!(
         result
             .stdout
+            .contains("[--password <password>] [--new-password <password>] [--token <token>]")
+    );
+    assert!(
+        result
+            .stdout
             .contains("passwd [--current-password <password>] [--new-password <password>]")
     );
     assert!(result.stdout.contains("admin users list"));
@@ -438,8 +443,196 @@ fn login_rejects_token_mode_when_auth_is_service_session() {
 }
 
 #[test]
+fn login_completes_required_password_change_and_relogin_in_one_flow() {
+    let home = TempDir::new().unwrap();
+    let login_count = Arc::new(Mutex::new(0usize));
+    let login_count_for_server = Arc::clone(&login_count);
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/auth/login") => {
+                let mut login_count = login_count_for_server.lock().unwrap();
+                *login_count += 1;
+                let body: Value = serde_json::from_str(&request.body).unwrap();
+                if *login_count == 1 {
+                    assert_eq!(
+                        body,
+                        serde_json::json!({
+                            "username": "alice",
+                            "password": "temporary-pass",
+                        })
+                    );
+                    return StubResponse::json(
+                        r#"{"accessToken":"session-token-temp","actor":"alice","username":"alice","role":"user","mustChangePassword":true}"#,
+                    );
+                }
+                assert_eq!(
+                    body,
+                    serde_json::json!({
+                        "username": "alice",
+                        "password": "new-pass",
+                    })
+                );
+                StubResponse::json(
+                    r#"{"accessToken":"session-token-final","actor":"alice","username":"alice","role":"user","mustChangePassword":false}"#,
+                )
+            }
+            ("POST", "/v1/auth/change-password") => {
+                assert_eq!(
+                    request.authorization.as_deref(),
+                    Some("Bearer session-token-temp")
+                );
+                let body: Value = serde_json::from_str(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({
+                        "currentPassword": "temporary-pass",
+                        "newPassword": "new-pass",
+                    })
+                );
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("GET", "/v1/projects") => {
+                assert_eq!(
+                    request.authorization.as_deref(),
+                    Some("Bearer session-token-final")
+                );
+                StubResponse::json(r#"{"projects":[]}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    let login_result = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--username",
+            "alice",
+            "--password",
+            "temporary-pass",
+            "--new-password",
+            "new-pass",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+
+    assert_eq!(login_result.code, 0, "{}", login_result.stderr);
+    assert_eq!(login_result.stderr, "");
+    assert_eq!(
+        login_result.stdout,
+        "password updated\nlogged in as alice\n"
+    );
+    assert_eq!(*login_count.lock().unwrap(), 2);
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(config_path_for_home(home.path())).unwrap())
+            .unwrap();
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("accessToken"))
+            .and_then(Value::as_str),
+        Some("session-token-final")
+    );
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("username"))
+            .and_then(Value::as_str),
+        Some("alice")
+    );
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("mustChangePassword"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let list_result = run_cli(&["list"], &home_envs(&home), "", None);
+    assert_eq!(list_result.code, 0, "{}", list_result.stderr);
+    assert_eq!(list_result.stdout, "no projects\n");
+}
+
+#[test]
+fn login_fails_clearly_when_password_change_required_without_new_password_in_non_interactive_mode()
+{
+    let home = TempDir::new().unwrap();
+    let login_count = Arc::new(Mutex::new(0usize));
+    let login_count_for_server = Arc::clone(&login_count);
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/auth/login") => {
+                *login_count_for_server.lock().unwrap() += 1;
+                StubResponse::json(
+                    r#"{"accessToken":"session-token-temp","actor":"alice","username":"alice","role":"user","mustChangePassword":true}"#,
+                )
+            }
+            ("POST", "/v1/auth/change-password") => {
+                panic!("change-password should not be called without --new-password")
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    let result = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--username",
+            "alice",
+            "--password",
+            "temporary-pass",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+
+    assert_eq!(result.code, 1);
+    assert!(result.stderr.contains(
+        "password change required for this account. Re-run cfsurge login with --new-password <password>."
+    ));
+    assert_eq!(*login_count.lock().unwrap(), 1);
+    assert!(!config_path_for_home(home.path()).exists());
+}
+
+#[test]
+fn cloudflare_admin_login_rejects_new_password() {
+    let home = TempDir::new().unwrap();
+    let result = run_cli(
+        &[
+            "login",
+            "--auth",
+            "cloudflare-admin",
+            "--api-base",
+            "https://api.example.test",
+            "--token",
+            "token",
+            "--new-password",
+            "new-pass",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+    assert_eq!(result.code, 1);
+    assert!(
+        result
+            .stderr
+            .contains("--new-password is only available with service-session login")
+    );
+}
+
+#[test]
 fn must_change_password_blocks_commands_until_passwd() {
     let home = TempDir::new().unwrap();
+    let login_count = Arc::new(Mutex::new(0usize));
+    let login_count_for_server = Arc::clone(&login_count);
     let server = start_stub_server(move |_, request| {
         match (request.method.as_str(), request.url.as_str()) {
             ("POST", "/v1/auth/change-password") => {
@@ -457,7 +650,27 @@ fn must_change_password_blocks_commands_until_passwd() {
                 );
                 StubResponse::json(r#"{"ok":true}"#)
             }
-            ("GET", "/v1/projects") => StubResponse::json(r#"{"projects":[]}"#),
+            ("POST", "/v1/auth/login") => {
+                *login_count_for_server.lock().unwrap() += 1;
+                let body: Value = serde_json::from_str(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({
+                        "username": "bob",
+                        "password": "new-pass",
+                    })
+                );
+                StubResponse::json(
+                    r#"{"accessToken":"session-token-3","actor":"bob","username":"bob","role":"user","mustChangePassword":false}"#,
+                )
+            }
+            ("GET", "/v1/projects") => {
+                assert_eq!(
+                    request.authorization.as_deref(),
+                    Some("Bearer session-token-3")
+                );
+                StubResponse::json(r#"{"projects":[]}"#)
+            }
             _ => StubResponse::text(404, "not found"),
         }
     });
@@ -491,10 +704,8 @@ fn must_change_password_blocks_commands_until_passwd() {
         None,
     );
     assert_eq!(passwd_result.code, 0, "{}", passwd_result.stderr);
-    assert_eq!(
-        passwd_result.stdout,
-        "password updated\nsession revoked. Run cfsurge login\n"
-    );
+    assert_eq!(passwd_result.stdout, "password updated\nlogged in as bob\n");
+    assert_eq!(*login_count.lock().unwrap(), 1);
 
     let config: Value =
         serde_json::from_str(&fs::read_to_string(config_path_for_home(home.path())).unwrap())
@@ -506,22 +717,22 @@ fn must_change_password_blocks_commands_until_passwd() {
             .and_then(Value::as_bool),
         Some(false)
     );
-    assert!(
+    assert_eq!(
         config
             .get("auth")
             .and_then(|auth| auth.get("accessToken"))
-            .is_none()
+            .and_then(Value::as_str),
+        Some("session-token-3")
     );
 
-    let list_without_relogin = run_cli(&["list"], &home_envs(&home), "", None);
-    assert_eq!(list_without_relogin.code, 1);
-    assert_eq!(list_without_relogin.stdout, "");
-    assert!(list_without_relogin.stderr.contains("Run cfsurge login."));
+    let allowed_list = run_cli(&["list"], &home_envs(&home), "", None);
+    assert_eq!(allowed_list.code, 0, "{}", allowed_list.stderr);
+    assert_eq!(allowed_list.stdout, "no projects\n");
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn passwd_clears_keychain_backed_service_session_token() {
+fn passwd_relogs_keychain_backed_service_session_token() {
     let home = TempDir::new().unwrap();
     let fake_security_root = TempDir::new().unwrap();
     let (bin_dir, store_path, log_path) = create_fake_security_command(fake_security_root.path());
@@ -532,6 +743,19 @@ fn passwd_clears_keychain_backed_service_session_token() {
     let server = start_stub_server(move |_, request| {
         match (request.method.as_str(), request.url.as_str()) {
             ("POST", "/v1/auth/change-password") => StubResponse::json(r#"{"ok":true}"#),
+            ("POST", "/v1/auth/login") => {
+                let body: Value = serde_json::from_str(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({
+                        "username": "bob",
+                        "password": "new-pass",
+                    })
+                );
+                StubResponse::json(
+                    r#"{"accessToken":"session-token-keychain-new","actor":"bob","username":"bob","role":"user","mustChangePassword":false}"#,
+                )
+            }
             _ => StubResponse::text(404, "not found"),
         }
     });
@@ -565,16 +789,23 @@ fn passwd_clears_keychain_backed_service_session_token() {
     );
 
     assert_eq!(result.code, 0, "{}", result.stderr);
-    assert_eq!(
-        result.stdout,
-        "password updated\nsession revoked. Run cfsurge login\n"
-    );
+    assert_eq!(result.stdout, "password updated\nlogged in as bob\n");
     assert_eq!(result.stderr, "");
-    assert!(!store_path.exists());
+    assert_eq!(
+        fs::read_to_string(&store_path).unwrap(),
+        "session-token-keychain-new"
+    );
 
     let config: Value =
         serde_json::from_str(&fs::read_to_string(config_path_for_home(home.path())).unwrap())
             .unwrap();
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("mustChangePassword"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
     assert!(
         config
             .get("auth")
@@ -584,7 +815,90 @@ fn passwd_clears_keychain_backed_service_session_token() {
 
     let log = fs::read_to_string(log_path).unwrap();
     assert!(log.contains("find-generic-password"));
-    assert!(log.contains("delete-generic-password"));
+    assert!(log.contains("add-generic-password"));
+}
+
+#[test]
+fn passwd_auto_relogin_failure_clears_session_and_errors() {
+    let home = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/auth/change-password") => StubResponse::json(r#"{"ok":true}"#),
+            ("POST", "/v1/auth/login") => StubResponse::text(401, "invalid credentials"),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"auth\": {{\n    \"type\": \"service-session\",\n    \"tokenStorage\": \"file\",\n    \"accessToken\": \"session-token-4\",\n    \"username\": \"bob\",\n    \"mustChangePassword\": true\n  }}\n}}\n",
+            server.api_base
+        ),
+    );
+
+    let result = run_cli(
+        &[
+            "passwd",
+            "--current-password",
+            "temp-pass",
+            "--new-password",
+            "new-pass",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+
+    assert_eq!(result.code, 1);
+    assert!(result.stderr.contains(
+        "password updated, but automatic re-login failed. Run cfsurge login with your new password."
+    ));
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(config_path_for_home(home.path())).unwrap())
+            .unwrap();
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("mustChangePassword"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("accessToken"))
+            .is_none()
+    );
+}
+
+#[test]
+fn passwd_fails_when_stored_service_session_username_is_missing() {
+    let home = TempDir::new().unwrap();
+    write_config(
+        home.path(),
+        "{\n  \"apiBase\": \"https://api.example.test\",\n  \"auth\": {\n    \"type\": \"service-session\",\n    \"tokenStorage\": \"file\",\n    \"accessToken\": \"session-token-missing-user\",\n    \"mustChangePassword\": true\n  }\n}\n",
+    );
+
+    let result = run_cli(
+        &[
+            "passwd",
+            "--current-password",
+            "temp-pass",
+            "--new-password",
+            "new-pass",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+    assert_eq!(result.code, 1);
+    assert!(
+        result
+            .stderr
+            .contains("stored service-session username is missing. Run cfsurge login.")
+    );
 }
 
 #[cfg(target_os = "macos")]

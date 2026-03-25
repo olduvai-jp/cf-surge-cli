@@ -54,6 +54,13 @@ cfsurge login
 cfsurge login --api-base https://api.example.com --username <USERNAME> --password <PASSWORD>
 ```
 
+パスワード変更必須 (`mustChangePassword`) のアカウントでは、`login` がそのまま変更フローを完了できます。
+非対話実行では `--new-password` を指定してください。
+
+```bash
+cfsurge login --api-base https://api.example.com --username <USERNAME> --password <TEMP_PASSWORD> --new-password <NEW_PASSWORD>
+```
+
 Cloudflare API token を指定すると、`cloudflare-admin` モードが自動選択されます。
 明示する場合は次のように実行できます。
 
@@ -105,7 +112,7 @@ cfsurge publish dist --slug my-site
 ## コマンド一覧
 
 ```text
-login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--token <token>] [--token-storage <file|keychain>]
+login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--new-password <password>] [--token <token>] [--token-storage <file|keychain>]
 init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]
 publish [dir] [--slug <slug>]
 --version
@@ -121,7 +128,7 @@ logout
 ```
 
 `login` の既定保存先は `file` で、`--token-storage keychain` を明示した場合のみ macOS Keychain を利用します。  
-`passwd` は `service-session` ログイン時のみ利用できます。
+`passwd` は `service-session` ログイン時のみ利用でき、成功時は自動再ログインされます。
 
 `list` は TSV 形式で 1 行ずつ出力します。
 
@@ -179,5 +186,11 @@ logout
   `--visibility` は `public` か `unlisted` のみ指定できます。
 - `password change required. Run cfsurge passwd.`  
   `service-session` ログイン後に初回変更が必須な状態です。`cfsurge passwd` を実行してください。
+- `password change required for this account. Re-run cfsurge login with --new-password <password>.`  
+  非対話モードの `login` でパスワード変更必須アカウントを処理する場合は `--new-password` を指定してください。
+- `--new-password is only available with service-session login`  
+  `--new-password` は `service-session` ログイン時のみ利用できます。
+- `password updated, but automatic re-login failed. Run cfsurge login with your new password.`  
+  `passwd` 後の自動再ログインに失敗しています。新しいパスワードで `cfsurge login` を実行してください。
 - `token-based login requires --auth cloudflare-admin`  
   `--token` または `CFSURGE_TOKEN` を使うと、通常は `cloudflare-admin` が自動選択されます。`--auth service-session` を明示しつつ token を指定した場合にこのエラーになります。

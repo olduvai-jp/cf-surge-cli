@@ -11,6 +11,7 @@ chmod +x ./cfsurge
 ./cfsurge --version
 ./cfsurge login
 ./cfsurge login --api-base https://api.example.com --username alice --password <PASSWORD>
+./cfsurge login --api-base https://api.example.com --username alice --password <TEMP_PASSWORD> --new-password <NEW_PASSWORD>
 ./cfsurge login --api-base https://api.example.com --auth cloudflare-admin --token <TOKEN>
 ./cfsurge init
 ./cfsurge publish
@@ -28,6 +29,7 @@ chmod +x ./cfsurge
 ./cfsurge --version
 ./cfsurge login
 ./cfsurge login --api-base https://api.example.com --username alice --password <PASSWORD>
+./cfsurge login --api-base https://api.example.com --username alice --password <TEMP_PASSWORD> --new-password <NEW_PASSWORD>
 ./cfsurge login --api-base https://api.example.com --auth cloudflare-admin --token <TOKEN>
 ./cfsurge init
 ./cfsurge publish
@@ -44,6 +46,7 @@ Expand-Archive .\cfsurge-windows-x64.zip -DestinationPath .
 .\cfsurge.exe --version
 .\cfsurge.exe login
 .\cfsurge.exe login --api-base https://api.example.com --username alice --password <PASSWORD>
+.\cfsurge.exe login --api-base https://api.example.com --username alice --password <TEMP_PASSWORD> --new-password <NEW_PASSWORD>
 .\cfsurge.exe login --api-base https://api.example.com --auth cloudflare-admin --token <TOKEN>
 .\cfsurge.exe init
 .\cfsurge.exe publish
@@ -59,6 +62,8 @@ Expand-Archive .\cfsurge-windows-x64.zip -DestinationPath .
 - Default `login` mode is `service-session` and prompts `Username:` / `Password:` unless provided by flags or `CFSURGE_USERNAME`/`CFSURGE_PASSWORD`.
 - When `--token` or `CFSURGE_TOKEN` is present, login defaults to `cloudflare-admin`.
 - If `--auth service-session` is explicitly combined with token input, login fails with `token-based login requires --auth cloudflare-admin`.
+- If a service-session account requires password change, `login` can complete it inline. Non-interactive runs must pass `--new-password`.
+- `--new-password` is rejected for `cloudflare-admin` login.
 - `init` writes `.cfsurge.json` in the current directory and stores `slug`, `publishDir`, and `visibility`.
 - `init --visibility unlisted` can be used when the service supports obfuscated publish URLs.
 - `publish` uses the positional directory argument first, then the `publishDir` field in `.cfsurge.json`.
@@ -66,5 +71,5 @@ Expand-Archive .\cfsurge-windows-x64.zip -DestinationPath .
 - `publish` uses the `visibility` field in `.cfsurge.json` to choose `public` or `unlisted`.
 - `remove` uses the positional slug first, then the `slug` field in `.cfsurge.json`.
 - `list` prints TSV columns: `slug`, `visibility`, `servedUrl`, `activeDeploymentId`, `updatedAt`, `updatedBy`.
-- `passwd` is available only for `service-session` logins.
+- `passwd` is available only for `service-session` logins and auto re-logs in on success.
 - `admin users` supports `list`, `create`, `reset-password`, `disable`, and `enable`.

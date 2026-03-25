@@ -152,6 +152,15 @@ struct ServiceLoginResponse {
     must_change_password: Option<bool>,
 }
 
+#[derive(Debug)]
+struct ResolvedServiceLogin {
+    access_token: String,
+    actor: String,
+    username: String,
+    role: Option<String>,
+    must_change_password: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct AdminUsersPayload {
     users: Option<Vec<AdminUserRecord>>,
@@ -235,10 +244,14 @@ fn login(args: &[String]) -> Result<(), String> {
         .ok()
         .and_then(|value| read_string(&value));
     let mode = resolve_login_mode(read_flag(args, "--auth"), &token_from_flag, &token_from_env)?;
+    let login_new_password = parse_new_password_flag(args)?;
     let requested_token_storage = parse_token_storage_input(read_flag(args, "--token-storage"))?;
     let token_storage_preference = resolve_token_storage_preference(requested_token_storage)?;
-    let client = Client::new();
     if mode == AuthType::CloudflareAdmin {
+        if login_new_password.is_some() {
+            return Err("--new-password is only available with service-session login".into());
+        }
+        let client = Client::new();
         let metadata = fetch_api_metadata(&api_base);
         print_token_creation_hint_if_needed(
             token_from_flag.as_deref(),
@@ -298,53 +311,29 @@ fn login(args: &[String]) -> Result<(), String> {
 
     let username = resolve_username(args)?;
     let password = resolve_password(args)?;
-    let response = client
-        .post(format!("{api_base}/v1/auth/login"))
-        .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({
-            "username": username,
-            "password": password,
-        }))
-        .send()
-        .map_err(format_http_error)?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "login failed: {}",
-            response.text().unwrap_or_default()
-        ));
+    let initial_login = login_with_service_session(&api_base, &username, &password)?;
+    let mut final_login = initial_login;
+
+    if final_login.must_change_password {
+        let new_password = resolve_login_new_password(login_new_password)?;
+        change_service_session_password(
+            &api_base,
+            &final_login.access_token,
+            &password,
+            &new_password,
+        )?;
+        final_login = login_with_service_session(&api_base, &username, &new_password)?;
+        if final_login.must_change_password {
+            return Err(
+                "login failed: password change completed but server still requires password change"
+                    .into(),
+            );
+        }
+        println!("password updated");
     }
-    let login_result = response
-        .json::<ServiceLoginResponse>()
-        .map_err(format_http_error)?;
-    let access_token = read_string_opt(login_result.access_token.as_ref())
-        .ok_or_else(|| "login failed: missing accessToken".to_string())?;
-    let token_storage = persist_token(&access_token, token_storage_preference)?;
-    write_config_file(&StoredConfig {
-        api_base,
-        auth: Some(StoredAuth {
-            auth_type: AuthType::ServiceSession,
-            token_storage: Some(token_storage),
-            access_token: if token_storage == TokenStorage::File {
-                Some(access_token)
-            } else {
-                None
-            },
-            actor: read_string_opt(login_result.actor.as_ref()),
-            username: read_string_opt(login_result.username.as_ref())
-                .or_else(|| Some(username.clone())),
-            role: read_string_opt(login_result.role.as_ref()),
-            must_change_password: Some(login_result.must_change_password == Some(true)),
-        }),
-        token_storage: None,
-        token: None,
-    })?;
-    let actor = read_string_opt(login_result.actor.as_ref())
-        .or_else(|| read_string_opt(login_result.username.as_ref()))
-        .unwrap_or(username);
-    println!("logged in as {actor}");
-    if login_result.must_change_password == Some(true) {
-        println!("password change required. Run cfsurge passwd");
-    }
+
+    persist_service_session_auth(&api_base, &final_login, token_storage_preference, &username)?;
+    println!("logged in as {}", final_login.actor);
     Ok(())
 }
 
@@ -599,6 +588,14 @@ fn change_password(args: &[String]) -> Result<(), String> {
     if config.auth_type != AuthType::ServiceSession {
         return Err("passwd is only available for service-session login.".into());
     }
+    let stored = read_stored_config()?;
+    let username = stored
+        .auth
+        .as_ref()
+        .and_then(|auth| read_string_opt(auth.username.as_ref()))
+        .ok_or_else(|| {
+            "stored service-session username is missing. Run cfsurge login.".to_string()
+        })?;
 
     let current_password = match read_flag(args, "--current-password") {
         Some(value) => value,
@@ -612,27 +609,41 @@ fn change_password(args: &[String]) -> Result<(), String> {
         return Err("new password cannot be empty".into());
     }
 
-    let client = Client::new();
-    let response = client
-        .post(format!("{}/v1/auth/change-password", config.api_base))
-        .headers(auth_headers(&config.token)?)
-        .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({
-            "currentPassword": current_password,
-            "newPassword": new_password,
-        }))
-        .send()
-        .map_err(format_http_error)?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "passwd failed: {}",
-            response.text().unwrap_or_default()
-        ));
+    change_service_session_password(
+        &config.api_base,
+        &config.token,
+        &current_password,
+        &new_password,
+    )?;
+
+    let fallback_error = "password updated, but automatic re-login failed. Run cfsurge login with your new password.";
+    let relogin = match login_with_service_session(&config.api_base, &username, &new_password) {
+        Ok(value) if !value.must_change_password => value,
+        _ => {
+            let _ = clear_stored_service_session_auth();
+            return Err(fallback_error.into());
+        }
+    };
+    let token_storage_preference = stored
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.token_storage)
+        .or(stored.token_storage)
+        .unwrap_or(TokenStorage::File);
+    if persist_service_session_auth(
+        &config.api_base,
+        &relogin,
+        token_storage_preference,
+        &username,
+    )
+    .is_err()
+    {
+        let _ = clear_stored_service_session_auth();
+        return Err(fallback_error.into());
     }
 
-    finalize_password_change_local_auth_state()?;
     println!("password updated");
-    println!("session revoked. Run cfsurge login");
+    println!("logged in as {}", relogin.actor);
     Ok(())
 }
 
@@ -1135,7 +1146,7 @@ fn write_config_file(config: &StoredConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn finalize_password_change_local_auth_state() -> Result<(), String> {
+fn clear_stored_service_session_auth() -> Result<(), String> {
     let Some(mut stored) = read_stored_config_if_exists()? else {
         return Ok(());
     };
@@ -1162,6 +1173,100 @@ fn finalize_password_change_local_auth_state() -> Result<(), String> {
     stored.auth = Some(auth);
     stored.token = None;
     write_config_file(&stored)
+}
+
+fn persist_service_session_auth(
+    api_base: &str,
+    login: &ResolvedServiceLogin,
+    token_storage_preference: TokenStorage,
+    username_fallback: &str,
+) -> Result<(), String> {
+    let token_storage = persist_token(&login.access_token, token_storage_preference)?;
+    let username = read_string(&login.username).unwrap_or_else(|| username_fallback.to_string());
+    write_config_file(&StoredConfig {
+        api_base: api_base.to_string(),
+        auth: Some(StoredAuth {
+            auth_type: AuthType::ServiceSession,
+            token_storage: Some(token_storage),
+            access_token: if token_storage == TokenStorage::File {
+                Some(login.access_token.clone())
+            } else {
+                None
+            },
+            actor: Some(login.actor.clone()),
+            username: Some(username),
+            role: login.role.clone(),
+            must_change_password: Some(false),
+        }),
+        token_storage: None,
+        token: None,
+    })
+}
+
+fn login_with_service_session(
+    api_base: &str,
+    username: &str,
+    password: &str,
+) -> Result<ResolvedServiceLogin, String> {
+    let client = Client::new();
+    let response = client
+        .post(format!("{api_base}/v1/auth/login"))
+        .header(CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({
+            "username": username,
+            "password": password,
+        }))
+        .send()
+        .map_err(format_http_error)?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "login failed: {}",
+            response.text().unwrap_or_default()
+        ));
+    }
+    let login_result = response
+        .json::<ServiceLoginResponse>()
+        .map_err(format_http_error)?;
+    let access_token = read_string_opt(login_result.access_token.as_ref())
+        .ok_or_else(|| "login failed: missing accessToken".to_string())?;
+    let resolved_username =
+        read_string_opt(login_result.username.as_ref()).unwrap_or_else(|| username.to_string());
+    let actor =
+        read_string_opt(login_result.actor.as_ref()).unwrap_or_else(|| resolved_username.clone());
+
+    Ok(ResolvedServiceLogin {
+        access_token,
+        actor,
+        username: resolved_username,
+        role: read_string_opt(login_result.role.as_ref()),
+        must_change_password: login_result.must_change_password == Some(true),
+    })
+}
+
+fn change_service_session_password(
+    api_base: &str,
+    token: &str,
+    current_password: &str,
+    new_password: &str,
+) -> Result<(), String> {
+    let client = Client::new();
+    let response = client
+        .post(format!("{api_base}/v1/auth/change-password"))
+        .headers(auth_headers(token)?)
+        .header(CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({
+            "currentPassword": current_password,
+            "newPassword": new_password,
+        }))
+        .send()
+        .map_err(format_http_error)?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "passwd failed: {}",
+            response.text().unwrap_or_default()
+        ));
+    }
+    Ok(())
 }
 
 fn can_use_mac_keychain() -> bool {
@@ -1371,6 +1476,36 @@ fn resolve_password(args: &[String]) -> Result<String, String> {
     prompt_until_valid("Password", |value| {
         if value.trim().is_empty() {
             Err("password is required".into())
+        } else {
+            Ok(value.to_string())
+        }
+    })
+}
+
+fn parse_new_password_flag(args: &[String]) -> Result<Option<String>, String> {
+    let Some(value) = read_flag(args, "--new-password") else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Err("new password cannot be empty".into());
+    }
+    Ok(Some(value))
+}
+
+fn resolve_login_new_password(parsed_flag: Option<String>) -> Result<String, String> {
+    if let Some(value) = parsed_flag {
+        return Ok(value);
+    }
+    if !is_interactive_prompt_session() {
+        return Err(
+            "password change required for this account. Re-run cfsurge login with --new-password <password>.".into(),
+        );
+    }
+
+    println!("password change required for this account.");
+    prompt_until_valid("New password", |value| {
+        if value.trim().is_empty() {
+            Err("new password cannot be empty".into())
         } else {
             Ok(value.to_string())
         }
@@ -1925,7 +2060,7 @@ fn read_stdin_line() -> Result<String, String> {
 
 fn print_help() {
     print!(
-        "cfsurge commands:\n  login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  passwd [--current-password <password>] [--new-password <password>]\n  admin users list\n  admin users create --username <username> [--role <user|admin>] [--temporary-password <password>]\n  admin users reset-password <username>\n  admin users disable <username>\n  admin users enable <username>\n  logout\n  interactive choices: use ↑/↓ and Enter\n"
+        "cfsurge commands:\n  login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--new-password <password>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  passwd [--current-password <password>] [--new-password <password>]\n  admin users list\n  admin users create --username <username> [--role <user|admin>] [--temporary-password <password>]\n  admin users reset-password <username>\n  admin users disable <username>\n  admin users enable <username>\n  logout\n  interactive choices: use ↑/↓ and Enter\n"
     );
 }
 
