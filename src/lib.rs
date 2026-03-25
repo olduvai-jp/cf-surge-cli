@@ -19,6 +19,7 @@ use walkdir::WalkDir;
 const SITE_CONFIG_FILE_NAME: &str = ".cfsurge.json";
 const GENERIC_TOKEN_DASHBOARD_URL: &str = "https://dash.cloudflare.com/profile/api-tokens";
 const API_BASE_PROMPT_GUIDANCE: &str = "Enter API base URL (for example: https://api.example.com)";
+const USERNAME_PROMPT_GUIDANCE: &str = "Use your issued username from the admin.";
 const DEV_CLI_VERSION: &str = "0.0.0-dev";
 const KEYCHAIN_SERVICE: &str = "cfsurge";
 const KEYCHAIN_ACCOUNT: &str = "api-token";
@@ -33,6 +34,8 @@ const UNLISTED_FALLBACK_LABEL: &str = "u";
 struct StoredConfig {
     api_base: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<StoredAuth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     token_storage: Option<TokenStorage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<String>,
@@ -43,6 +46,32 @@ struct StoredConfig {
 enum TokenStorage {
     Keychain,
     File,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum AuthType {
+    CloudflareAdmin,
+    ServiceSession,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAuth {
+    #[serde(rename = "type")]
+    auth_type: AuthType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_storage: Option<TokenStorage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    must_change_password: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -110,7 +139,38 @@ struct FileEntry {
 
 #[derive(Debug, Deserialize)]
 struct AuthVerifyResponse {
-    actor: String,
+    actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceLoginResponse {
+    access_token: Option<String>,
+    actor: Option<String>,
+    username: Option<String>,
+    role: Option<String>,
+    must_change_password: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminUsersPayload {
+    users: Option<Vec<AdminUserRecord>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminUserRecord {
+    username: Option<String>,
+    role: Option<String>,
+    status: Option<String>,
+    must_change_password: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminUserMutationPayload {
+    username: Option<String>,
+    temporary_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +204,8 @@ fn run_with_args(args: Vec<String>) -> Result<(), String> {
         Some("publish") => publish(&args[1..]),
         Some("list") => list_projects(),
         Some("remove") => remove_project(&args[1..]),
+        Some("passwd") => change_password(&args[1..]),
+        Some("admin") => admin(&args[1..]),
         Some("logout") => logout(),
         Some("--version") => {
             print_version();
@@ -168,52 +230,121 @@ fn login(args: &[String]) -> Result<(), String> {
             .as_ref()
             .map(|config| config.api_base.as_str()),
     )?;
-    let metadata = fetch_api_metadata(&api_base);
     let token_from_flag = read_flag(args, "--token");
     let token_from_env = env::var("CFSURGE_TOKEN")
         .ok()
         .and_then(|value| read_string(&value));
+    let mode = resolve_login_mode(read_flag(args, "--auth"), &token_from_flag, &token_from_env)?;
     let requested_token_storage = parse_token_storage_input(read_flag(args, "--token-storage"))?;
-    print_token_creation_hint_if_needed(
-        token_from_flag.as_deref(),
-        token_from_env.as_deref(),
-        metadata.as_ref(),
-    )?;
-    let token = match token_from_flag.or(token_from_env) {
-        Some(token) => token,
-        None => prompt("Cloudflare API token")?,
-    };
     let token_storage_preference = resolve_token_storage_preference(requested_token_storage)?;
-
     let client = Client::new();
+    if mode == AuthType::CloudflareAdmin {
+        let metadata = fetch_api_metadata(&api_base);
+        print_token_creation_hint_if_needed(
+            token_from_flag.as_deref(),
+            token_from_env.as_deref(),
+            metadata.as_ref(),
+        )?;
+        let token = match token_from_flag.or(token_from_env) {
+            Some(token) => token,
+            None => prompt("Cloudflare API token")?,
+        };
+        let response = client
+            .post(format!("{api_base}/v1/auth/verify"))
+            .headers(auth_headers(&token)?)
+            .send()
+            .map_err(format_http_error)?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "login failed: {}",
+                response.text().unwrap_or_default()
+            ));
+        }
+        let verify_result = response
+            .json::<AuthVerifyResponse>()
+            .map_err(format_http_error)?;
+        let token_storage = persist_token(&token, token_storage_preference)?;
+        write_config_file(&StoredConfig {
+            api_base,
+            auth: Some(StoredAuth {
+                auth_type: AuthType::CloudflareAdmin,
+                token_storage: Some(token_storage),
+                access_token: if token_storage == TokenStorage::File {
+                    Some(token.clone())
+                } else {
+                    None
+                },
+                actor: read_string_opt(verify_result.actor.as_ref()),
+                username: None,
+                role: None,
+                must_change_password: None,
+            }),
+            token_storage: Some(token_storage),
+            token: if token_storage == TokenStorage::File {
+                Some(token)
+            } else {
+                None
+            },
+        })?;
+        let actor = read_string_opt(verify_result.actor.as_ref())
+            .unwrap_or_else(|| "cloudflare-admin".into());
+        println!("logged in as {actor}");
+        return Ok(());
+    }
+
+    if token_from_flag.is_some() || token_from_env.is_some() {
+        return Err("token-based login requires --auth cloudflare-admin".into());
+    }
+
+    let username = resolve_username(args)?;
+    let password = resolve_password(args)?;
     let response = client
-        .post(format!("{api_base}/v1/auth/verify"))
-        .headers(auth_headers(&token)?)
+        .post(format!("{api_base}/v1/auth/login"))
+        .header(CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({
+            "username": username,
+            "password": password,
+        }))
         .send()
         .map_err(format_http_error)?;
-
     if !response.status().is_success() {
         return Err(format!(
             "login failed: {}",
             response.text().unwrap_or_default()
         ));
     }
-
-    let token_storage = persist_token(&token, token_storage_preference)?;
+    let login_result = response
+        .json::<ServiceLoginResponse>()
+        .map_err(format_http_error)?;
+    let access_token = read_string_opt(login_result.access_token.as_ref())
+        .ok_or_else(|| "login failed: missing accessToken".to_string())?;
+    let token_storage = persist_token(&access_token, token_storage_preference)?;
     write_config_file(&StoredConfig {
         api_base,
-        token_storage: Some(token_storage),
-        token: if token_storage == TokenStorage::File {
-            Some(token)
-        } else {
-            None
-        },
+        auth: Some(StoredAuth {
+            auth_type: AuthType::ServiceSession,
+            token_storage: Some(token_storage),
+            access_token: if token_storage == TokenStorage::File {
+                Some(access_token)
+            } else {
+                None
+            },
+            actor: read_string_opt(login_result.actor.as_ref()),
+            username: read_string_opt(login_result.username.as_ref())
+                .or_else(|| Some(username.clone())),
+            role: read_string_opt(login_result.role.as_ref()),
+            must_change_password: Some(login_result.must_change_password == Some(true)),
+        }),
+        token_storage: None,
+        token: None,
     })?;
-
-    let result = response
-        .json::<AuthVerifyResponse>()
-        .map_err(format_http_error)?;
-    println!("logged in as {}", result.actor);
+    let actor = read_string_opt(login_result.actor.as_ref())
+        .or_else(|| read_string_opt(login_result.username.as_ref()))
+        .unwrap_or(username);
+    println!("logged in as {actor}");
+    if login_result.must_change_password == Some(true) {
+        println!("password change required. Run cfsurge passwd");
+    }
     Ok(())
 }
 
@@ -295,7 +426,7 @@ fn publish(args: &[String]) -> Result<(), String> {
         )
     })?;
 
-    let config = read_config()?;
+    let config = read_config(ReadConfigOptions::default())?;
     let metadata = if visibility == Visibility::Unlisted {
         fetch_api_metadata(&config.api_base)
     } else {
@@ -386,7 +517,7 @@ fn publish(args: &[String]) -> Result<(), String> {
 }
 
 fn list_projects() -> Result<(), String> {
-    let config = read_config()?;
+    let config = read_config(ReadConfigOptions::default())?;
     let client = Client::new();
     let response = client
         .get(format!("{}/v1/projects", config.api_base))
@@ -439,7 +570,7 @@ fn remove_project(args: &[String]) -> Result<(), String> {
             "usage: cfsurge remove [slug] (or configure {SITE_CONFIG_FILE_NAME} via cfsurge init)"
         )
     })?;
-    let config = read_config()?;
+    let config = read_config(ReadConfigOptions::default())?;
     let reserved_labels = build_reserved_labels(Some(config.api_base.as_str()), None);
     assert_valid_slug(&slug, &reserved_labels)?;
 
@@ -461,7 +592,238 @@ fn remove_project(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn change_password(args: &[String]) -> Result<(), String> {
+    let config = read_config(ReadConfigOptions {
+        allow_must_change_password: true,
+    })?;
+    if config.auth_type != AuthType::ServiceSession {
+        return Err("passwd is only available for service-session login.".into());
+    }
+
+    let current_password = match read_flag(args, "--current-password") {
+        Some(value) => value,
+        None => prompt("Current password")?,
+    };
+    let new_password = match read_flag(args, "--new-password") {
+        Some(value) => value,
+        None => prompt("New password")?,
+    };
+    if new_password.trim().is_empty() {
+        return Err("new password cannot be empty".into());
+    }
+
+    let client = Client::new();
+    let response = client
+        .post(format!("{}/v1/auth/change-password", config.api_base))
+        .headers(auth_headers(&config.token)?)
+        .header(CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({
+            "currentPassword": current_password,
+            "newPassword": new_password,
+        }))
+        .send()
+        .map_err(format_http_error)?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "passwd failed: {}",
+            response.text().unwrap_or_default()
+        ));
+    }
+
+    update_stored_must_change_password(false)?;
+    println!("password updated");
+    Ok(())
+}
+
+fn admin(args: &[String]) -> Result<(), String> {
+    let target = args.first().map(String::as_str);
+    let action = args.get(1).map(String::as_str);
+    if target != Some("users") {
+        return Err(
+            "usage: cfsurge admin users <list|create|reset-password|disable|enable> [...]".into(),
+        );
+    }
+    let rest = if args.len() > 2 { &args[2..] } else { &[] };
+    match action {
+        Some("list") => admin_users_list(),
+        Some("create") => admin_users_create(rest),
+        Some("reset-password") => admin_users_reset_password(rest),
+        Some("disable") => admin_users_toggle_status(rest, "disable"),
+        Some("enable") => admin_users_toggle_status(rest, "enable"),
+        _ => Err(
+            "usage: cfsurge admin users <list|create|reset-password|disable|enable> [...]".into(),
+        ),
+    }
+}
+
+fn admin_users_list() -> Result<(), String> {
+    let config = read_config(ReadConfigOptions::default())?;
+    let client = Client::new();
+    let response = client
+        .get(format!("{}/v1/admin/users", config.api_base))
+        .headers(auth_headers(&config.token)?)
+        .send()
+        .map_err(format_http_error)?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "admin users list failed: {}",
+            response.text().unwrap_or_default()
+        ));
+    }
+
+    let payload = response
+        .json::<AdminUsersPayload>()
+        .map_err(format_http_error)?;
+    let users = payload.users.unwrap_or_default();
+    if users.is_empty() {
+        println!("no users");
+        return Ok(());
+    }
+
+    for user in users {
+        println!(
+            "{}\t{}\t{}\t{}",
+            read_string_opt(user.username.as_ref()).unwrap_or_else(|| "-".into()),
+            read_string_opt(user.role.as_ref()).unwrap_or_else(|| "-".into()),
+            read_string_opt(user.status.as_ref()).unwrap_or_else(|| "-".into()),
+            if user.must_change_password == Some(true) {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
+    Ok(())
+}
+
+fn admin_users_create(args: &[String]) -> Result<(), String> {
+    let config = read_config(ReadConfigOptions::default())?;
+    let username = resolve_admin_username(args, "--username", "Username")?;
+    let role = parse_user_role(
+        read_flag(args, "--role")
+            .unwrap_or_else(|| "user".to_string())
+            .as_str(),
+    )?;
+    let temporary_password =
+        read_flag(args, "--temporary-password").and_then(|item| read_string(&item));
+    let mut body = serde_json::json!({
+        "username": username.clone(),
+        "role": role,
+    });
+    if let Some(value) = temporary_password {
+        body["temporaryPassword"] = serde_json::Value::String(value);
+    }
+
+    let client = Client::new();
+    let response = client
+        .post(format!("{}/v1/admin/users", config.api_base))
+        .headers(auth_headers(&config.token)?)
+        .header(CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .map_err(format_http_error)?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "admin users create failed: {}",
+            response.text().unwrap_or_default()
+        ));
+    }
+
+    let payload = response
+        .json::<AdminUserMutationPayload>()
+        .unwrap_or_default();
+    let created_user = read_string_opt(payload.username.as_ref()).unwrap_or(username);
+    println!("created user {created_user}");
+    if let Some(issued_password) = read_string_opt(payload.temporary_password.as_ref()) {
+        println!("temporary password: {issued_password}");
+    }
+    Ok(())
+}
+
+fn admin_users_reset_password(args: &[String]) -> Result<(), String> {
+    let config = read_config(ReadConfigOptions::default())?;
+    let username = resolve_admin_positional_username(
+        args,
+        "usage: cfsurge admin users reset-password <username>",
+    )?;
+
+    let client = Client::new();
+    let response = client
+        .post(format!(
+            "{}/v1/admin/users/{}/reset-password",
+            config.api_base,
+            encode(&username)
+        ))
+        .headers(auth_headers(&config.token)?)
+        .send()
+        .map_err(format_http_error)?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "admin users reset-password failed: {}",
+            response.text().unwrap_or_default()
+        ));
+    }
+
+    let payload = response
+        .json::<AdminUserMutationPayload>()
+        .unwrap_or_default();
+    println!("reset password for {username}");
+    if let Some(temporary_password) = read_string_opt(payload.temporary_password.as_ref()) {
+        println!("temporary password: {temporary_password}");
+    }
+    Ok(())
+}
+
+fn admin_users_toggle_status(args: &[String], action: &str) -> Result<(), String> {
+    let config = read_config(ReadConfigOptions::default())?;
+    let username = resolve_admin_positional_username(
+        args,
+        &format!("usage: cfsurge admin users {action} <username>"),
+    )?;
+
+    let client = Client::new();
+    let response = client
+        .post(format!(
+            "{}/v1/admin/users/{}/{}",
+            config.api_base,
+            encode(&username),
+            action
+        ))
+        .headers(auth_headers(&config.token)?)
+        .send()
+        .map_err(format_http_error)?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "admin users {action} failed: {}",
+            response.text().unwrap_or_default()
+        ));
+    }
+
+    println!("{action}d user {username}");
+    Ok(())
+}
+
 fn logout() -> Result<(), String> {
+    if let Some(stored) = read_stored_config_if_exists()? {
+        let stored_api_base = match env::var("CFSURGE_API_BASE")
+            .ok()
+            .and_then(|value| read_string(&value))
+        {
+            Some(value) => normalize_api_base(&value)?,
+            None => stored.api_base.clone(),
+        };
+        if resolve_stored_auth_type(&stored) == AuthType::ServiceSession
+            && let Some(token) = read_stored_token(&stored)?
+            && let Ok(headers) = auth_headers(&token)
+        {
+            let client = Client::new();
+            let _ = client
+                .post(format!("{stored_api_base}/v1/auth/logout"))
+                .headers(headers)
+                .send();
+        }
+    }
+
     let config_path = config_path()?;
     let _ = fs::remove_file(config_path);
 
@@ -478,20 +840,38 @@ fn logout() -> Result<(), String> {
     Ok(())
 }
 
-fn read_config() -> Result<CliConfig, String> {
+fn read_config(options: ReadConfigOptions) -> Result<CliConfig, String> {
     let stored = read_stored_config()?;
     let api_base = env::var("CFSURGE_API_BASE")
         .ok()
         .and_then(|value| read_string(&value))
         .unwrap_or(stored.api_base.clone());
-    let token = read_token(&stored)?;
-    Ok(CliConfig { api_base, token })
+    let token = read_stored_token(&stored)?
+        .ok_or_else(|| "missing API token. Run cfsurge login.".to_string())?;
+    let auth_type = resolve_stored_auth_type(&stored);
+    let must_change_password = stored.auth.as_ref().is_some_and(|auth| {
+        auth.auth_type == AuthType::ServiceSession && auth.must_change_password == Some(true)
+    });
+    if must_change_password && !options.allow_must_change_password {
+        return Err("password change required. Run cfsurge passwd.".into());
+    }
+    Ok(CliConfig {
+        api_base,
+        token,
+        auth_type,
+    })
 }
 
 #[derive(Clone, Debug)]
 struct CliConfig {
     api_base: String,
     token: String,
+    auth_type: AuthType,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReadConfigOptions {
+    allow_must_change_password: bool,
 }
 
 fn read_stored_config() -> Result<StoredConfig, String> {
@@ -517,6 +897,11 @@ fn parse_stored_config(raw: &str, path: &Path) -> Result<StoredConfig, String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .ok_or_else(|| format!("invalid config file: missing apiBase in {}", path.display()))?;
+    let auth = if value.get("auth").is_some() {
+        parse_stored_auth(value.get("auth"), path)?
+    } else {
+        None
+    };
     let token_storage = match value.get("tokenStorage").and_then(|item| item.as_str()) {
         Some("keychain") => Some(TokenStorage::Keychain),
         Some("file") => Some(TokenStorage::File),
@@ -537,9 +922,88 @@ fn parse_stored_config(raw: &str, path: &Path) -> Result<StoredConfig, String> {
     let token_storage = token_storage.or_else(|| token.as_ref().map(|_| TokenStorage::File));
     Ok(StoredConfig {
         api_base: api_base.to_string(),
+        auth,
         token_storage,
         token,
     })
+}
+
+fn parse_stored_auth(
+    value: Option<&serde_json::Value>,
+    path: &Path,
+) -> Result<Option<StoredAuth>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(auth) = value.as_object() else {
+        return Err(format!(
+            "invalid config file: unsupported auth in {}",
+            path.display()
+        ));
+    };
+
+    let Some(auth_type_raw) = auth.get("type").and_then(|item| item.as_str()) else {
+        return Err(format!(
+            "invalid config file: unsupported auth.type in {}",
+            path.display()
+        ));
+    };
+    let auth_type = match auth_type_raw.trim() {
+        "cloudflare-admin" => AuthType::CloudflareAdmin,
+        "service-session" => AuthType::ServiceSession,
+        _ => {
+            return Err(format!(
+                "invalid config file: unsupported auth.type in {}",
+                path.display()
+            ));
+        }
+    };
+    let token_storage = match auth.get("tokenStorage").and_then(|item| item.as_str()) {
+        Some("keychain") => Some(TokenStorage::Keychain),
+        Some("file") => Some(TokenStorage::File),
+        Some(_) => {
+            return Err(format!(
+                "invalid config file: unsupported auth.tokenStorage in {}",
+                path.display()
+            ));
+        }
+        None => None,
+    };
+    let access_token = auth
+        .get("accessToken")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned);
+    let token_storage = token_storage.or_else(|| access_token.as_ref().map(|_| TokenStorage::File));
+    let must_change_password = if auth.contains_key("mustChangePassword") {
+        Some(
+            auth.get("mustChangePassword")
+                .and_then(|item| item.as_bool())
+                .unwrap_or(false),
+        )
+    } else {
+        None
+    };
+
+    Ok(Some(StoredAuth {
+        auth_type,
+        token_storage,
+        access_token,
+        actor: auth
+            .get("actor")
+            .and_then(|item| item.as_str())
+            .and_then(read_string),
+        username: auth
+            .get("username")
+            .and_then(|item| item.as_str())
+            .and_then(read_string),
+        role: auth
+            .get("role")
+            .and_then(|item| item.as_str())
+            .and_then(read_string),
+        must_change_password,
+    }))
 }
 
 fn read_site_config_if_exists() -> Result<Option<SiteConfig>, String> {
@@ -581,28 +1045,44 @@ fn write_site_config(config: &SiteConfig) -> Result<(), String> {
     fs::write(site_config_path()?, append_newline(bytes)).map_err(|error| error.to_string())
 }
 
-fn read_token(config: &StoredConfig) -> Result<String, String> {
+fn read_stored_token(config: &StoredConfig) -> Result<Option<String>, String> {
     if let Some(token) = env::var("CFSURGE_TOKEN")
         .ok()
         .and_then(|value| read_string(&value))
     {
-        return Ok(token);
+        return Ok(Some(token));
     }
-    match config.token_storage {
+
+    if let Some(auth) = &config.auth {
+        return read_token_from_storage(auth.token_storage, auth.access_token.clone())
+            .and_then(|value| {
+                value.ok_or_else(|| "missing API token. Run cfsurge login.".to_string())
+            })
+            .map(Some);
+    }
+
+    read_token_from_storage(config.token_storage, config.token.clone())
+}
+
+fn read_token_from_storage(
+    token_storage: Option<TokenStorage>,
+    inline_token: Option<String>,
+) -> Result<Option<String>, String> {
+    match token_storage {
         Some(TokenStorage::Keychain) => {
             if !can_use_mac_keychain() {
-                if let Some(token) = config.token.clone() {
-                    return Ok(token);
+                if let Some(token) = inline_token {
+                    return Ok(Some(token));
                 }
                 return Err(
                     "stored token requires macOS Keychain, but it is unavailable. Run cfsurge login again.".into(),
                 );
             }
             match read_token_from_mac_keychain() {
-                Ok(token) => Ok(token),
+                Ok(token) => Ok(Some(token)),
                 Err(error) => {
-                    if let Some(token) = config.token.clone() {
-                        Ok(token)
+                    if let Some(token) = inline_token {
+                        Ok(Some(token))
                     } else {
                         Err(format!(
                             "failed to read token from macOS Keychain ({}). Run cfsurge login.",
@@ -612,11 +1092,10 @@ fn read_token(config: &StoredConfig) -> Result<String, String> {
                 }
             }
         }
-        Some(TokenStorage::File) => config
-            .token
-            .clone()
+        Some(TokenStorage::File) => inline_token
+            .map(Some)
             .ok_or_else(|| "config file token is missing. Run cfsurge login.".into()),
-        None => Err("missing API token. Run cfsurge login.".into()),
+        None => Ok(None),
     }
 }
 
@@ -653,6 +1132,21 @@ fn write_config_file(config: &StoredConfig) -> Result<(), String> {
         let _ = fs::set_permissions(config_path()?.as_path(), fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+fn update_stored_must_change_password(value: bool) -> Result<(), String> {
+    let Some(mut stored) = read_stored_config_if_exists()? else {
+        return Ok(());
+    };
+    let Some(mut auth) = stored.auth else {
+        return Ok(());
+    };
+    if auth.auth_type != AuthType::ServiceSession {
+        return Ok(());
+    }
+    auth.must_change_password = Some(value);
+    stored.auth = Some(auth);
+    write_config_file(&stored)
 }
 
 fn can_use_mac_keychain() -> bool {
@@ -823,6 +1317,51 @@ fn resolve_api_base(args: &[String], stored_api_base: Option<&str>) -> Result<St
     prompt_until_valid("API base URL", normalize_api_base)
 }
 
+fn resolve_username(args: &[String]) -> Result<String, String> {
+    if let Some(value) = read_flag(args, "--username").and_then(|value| read_string(&value)) {
+        return Ok(value);
+    }
+    if let Some(value) = env::var("CFSURGE_USERNAME")
+        .ok()
+        .and_then(|value| read_string(&value))
+    {
+        return Ok(value);
+    }
+    if is_interactive_prompt_session() {
+        println!("{USERNAME_PROMPT_GUIDANCE}");
+    }
+    prompt_until_valid("Username", |value| {
+        let value = value.trim();
+        if value.is_empty() {
+            Err("username is required".into())
+        } else {
+            Ok(value.to_string())
+        }
+    })
+}
+
+fn resolve_password(args: &[String]) -> Result<String, String> {
+    if let Some(value) = read_flag(args, "--password") {
+        if value.trim().is_empty() {
+            return Err("password is required".into());
+        }
+        return Ok(value);
+    }
+    if let Ok(value) = env::var("CFSURGE_PASSWORD") {
+        if value.trim().is_empty() {
+            return Err("password is required".into());
+        }
+        return Ok(value);
+    }
+    prompt_until_valid("Password", |value| {
+        if value.trim().is_empty() {
+            Err("password is required".into())
+        } else {
+            Ok(value.to_string())
+        }
+    })
+}
+
 fn resolve_slug(
     args: &[String],
     default_slug: Option<&str>,
@@ -967,6 +1506,76 @@ fn parse_token_storage_input(value: Option<String>) -> Result<Option<TokenStorag
         "file" => Ok(Some(TokenStorage::File)),
         "keychain" => Ok(Some(TokenStorage::Keychain)),
         _ => Err("invalid token storage: expected file or keychain".into()),
+    }
+}
+
+fn resolve_login_mode(
+    requested_mode: Option<String>,
+    token_from_flag: &Option<String>,
+    token_from_env: &Option<String>,
+) -> Result<AuthType, String> {
+    if let Some(value) = parse_login_mode_input(requested_mode)? {
+        return Ok(value);
+    }
+    if token_from_flag.is_some() || token_from_env.is_some() {
+        return Ok(AuthType::CloudflareAdmin);
+    }
+    Ok(AuthType::ServiceSession)
+}
+
+fn parse_login_mode_input(value: Option<String>) -> Result<Option<AuthType>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "service-session" | "service" | "password" => Ok(Some(AuthType::ServiceSession)),
+        "cloudflare-admin" | "cloudflare" => Ok(Some(AuthType::CloudflareAdmin)),
+        _ => Err("invalid login mode: expected service-session or cloudflare-admin".into()),
+    }
+}
+
+fn resolve_stored_auth_type(config: &StoredConfig) -> AuthType {
+    config
+        .auth
+        .as_ref()
+        .map(|item| item.auth_type)
+        .unwrap_or(AuthType::CloudflareAdmin)
+}
+
+fn resolve_admin_username(args: &[String], flag: &str, label: &str) -> Result<String, String> {
+    if let Some(value) = read_flag(args, flag).and_then(|item| read_string(&item)) {
+        return Ok(value);
+    }
+    prompt_until_valid(label, |value| {
+        let username = value.trim();
+        if username.is_empty() {
+            Err("username is required".into())
+        } else {
+            Ok(username.to_string())
+        }
+    })
+}
+
+fn resolve_admin_positional_username(
+    args: &[String],
+    usage_message: &str,
+) -> Result<String, String> {
+    let Some(username) = read_positional_arg(args) else {
+        return Err(usage_message.to_string());
+    };
+    let username = username.trim();
+    if username.is_empty() {
+        return Err(usage_message.to_string());
+    }
+    Ok(username.to_string())
+}
+
+fn parse_user_role(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "user" || normalized == "admin" {
+        Ok(normalized)
+    } else {
+        Err("invalid role: expected user or admin".into())
     }
 }
 
@@ -1301,7 +1910,7 @@ fn read_stdin_line() -> Result<String, String> {
 
 fn print_help() {
     print!(
-        "cfsurge commands:\n  login [--api-base <url>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  logout\n  interactive choices: use ↑/↓ and Enter\n"
+        "cfsurge commands:\n  login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  passwd [--current-password <password>] [--new-password <password>]\n  admin users list\n  admin users create --username <username> [--role <user|admin>] [--temporary-password <password>]\n  admin users reset-password <username>\n  admin users disable <username>\n  admin users enable <username>\n  logout\n  interactive choices: use ↑/↓ and Enter\n"
     );
 }
 
@@ -1397,8 +2006,9 @@ fn format_http_error(error: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiMetadata, FALLBACK_API_RESERVED_LABEL, assert_valid_slug, build_reserved_labels,
-        normalize_api_base, parse_publish_dir_input,
+        ApiMetadata, AuthType, FALLBACK_API_RESERVED_LABEL, assert_valid_slug,
+        build_reserved_labels, normalize_api_base, parse_login_mode_input, parse_publish_dir_input,
+        parse_user_role,
     };
 
     #[test]
@@ -1459,5 +2069,27 @@ mod tests {
     fn parse_publish_dir_input_rejects_empty_string() {
         let error = parse_publish_dir_input("   ").expect_err("empty publish dir must fail");
         assert_eq!(error, "publish directory cannot be empty");
+    }
+
+    #[test]
+    fn parse_login_mode_input_accepts_aliases() {
+        assert_eq!(
+            parse_login_mode_input(Some("service".to_string())).expect("service alias"),
+            Some(AuthType::ServiceSession)
+        );
+        assert_eq!(
+            parse_login_mode_input(Some("password".to_string())).expect("password alias"),
+            Some(AuthType::ServiceSession)
+        );
+        assert_eq!(
+            parse_login_mode_input(Some("cloudflare".to_string())).expect("cloudflare alias"),
+            Some(AuthType::CloudflareAdmin)
+        );
+    }
+
+    #[test]
+    fn parse_user_role_rejects_unknown_role() {
+        let error = parse_user_role("owner").expect_err("unknown role must fail");
+        assert_eq!(error, "invalid role: expected user or admin");
     }
 }

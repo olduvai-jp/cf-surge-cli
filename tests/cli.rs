@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use serde_json::Value;
 use tempfile::TempDir;
 use tiny_http::{Header, Response, Server, StatusCode};
 
@@ -70,6 +71,8 @@ fn run_cli(
     command.stderr(Stdio::piped());
     command.env_remove("CFSURGE_API_BASE");
     command.env_remove("CFSURGE_TOKEN");
+    command.env_remove("CFSURGE_USERNAME");
+    command.env_remove("CFSURGE_PASSWORD");
     command.env_remove("CFSURGE_CLI_VERSION");
     for (key, value) in envs {
         command.env(key, value);
@@ -266,6 +269,12 @@ fn help_output_includes_version() {
     assert_eq!(result.code, 0);
     assert_eq!(result.stderr, "");
     assert!(result.stdout.contains("--version"));
+    assert!(
+        result
+            .stdout
+            .contains("passwd [--current-password <password>] [--new-password <password>]")
+    );
+    assert!(result.stdout.contains("admin users list"));
     assert!(result.stdout.contains("interactive choices: use"));
 }
 
@@ -315,6 +324,189 @@ fn login_verifies_token_and_writes_config() {
         requests[1].authorization.as_deref(),
         Some("Bearer token-login")
     );
+}
+
+#[test]
+fn login_defaults_to_service_session_auth_with_username_password() {
+    let home = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/auth/login") => {
+                assert_eq!(request.content_type.as_deref(), Some("application/json"));
+                let body: Value = serde_json::from_str(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({
+                        "username": "alice",
+                        "password": "initial-password",
+                    })
+                );
+                StubResponse::json(
+                    r#"{"accessToken":"session-token-1","actor":"alice","username":"alice","role":"user","mustChangePassword":false}"#,
+                )
+            }
+            ("GET", "/v1/projects") => StubResponse::json(r#"{"projects":[]}"#),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    let login_result = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--username",
+            "alice",
+            "--password",
+            "initial-password",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+
+    assert_eq!(login_result.code, 0, "{}", login_result.stderr);
+    assert_eq!(login_result.stderr, "");
+    assert_eq!(login_result.stdout, "logged in as alice\n");
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(config_path_for_home(home.path())).unwrap())
+            .unwrap();
+    assert_eq!(
+        config.get("apiBase").and_then(Value::as_str),
+        Some(server.api_base.as_str())
+    );
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("type"))
+            .and_then(Value::as_str),
+        Some("service-session")
+    );
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("tokenStorage"))
+            .and_then(Value::as_str),
+        Some("file")
+    );
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("accessToken"))
+            .and_then(Value::as_str),
+        Some("session-token-1")
+    );
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("mustChangePassword"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(config.get("token").is_none());
+
+    let list_result = run_cli(&["list"], &home_envs(&home), "", None);
+    assert_eq!(list_result.code, 0, "{}", list_result.stderr);
+    assert_eq!(list_result.stdout, "no projects\n");
+}
+
+#[test]
+fn login_rejects_token_mode_when_auth_is_service_session() {
+    let home = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, _| StubResponse::text(404, "not found"));
+    let result = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--auth",
+            "service-session",
+            "--token",
+            "token-1",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+    assert_eq!(result.code, 1);
+    assert!(
+        result
+            .stderr
+            .contains("token-based login requires --auth cloudflare-admin")
+    );
+}
+
+#[test]
+fn must_change_password_blocks_commands_until_passwd() {
+    let home = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/auth/change-password") => {
+                assert_eq!(
+                    request.authorization.as_deref(),
+                    Some("Bearer session-token-2")
+                );
+                let body: Value = serde_json::from_str(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({
+                        "currentPassword": "temp-pass",
+                        "newPassword": "new-pass",
+                    })
+                );
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("GET", "/v1/projects") => StubResponse::json(r#"{"projects":[]}"#),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"auth\": {{\n    \"type\": \"service-session\",\n    \"tokenStorage\": \"file\",\n    \"accessToken\": \"session-token-2\",\n    \"username\": \"bob\",\n    \"mustChangePassword\": true\n  }}\n}}\n",
+            server.api_base
+        ),
+    );
+
+    let blocked_list = run_cli(&["list"], &home_envs(&home), "", None);
+    assert_eq!(blocked_list.code, 1);
+    assert!(
+        blocked_list
+            .stderr
+            .contains("password change required. Run cfsurge passwd.")
+    );
+
+    let passwd_result = run_cli(
+        &[
+            "passwd",
+            "--current-password",
+            "temp-pass",
+            "--new-password",
+            "new-pass",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+    assert_eq!(passwd_result.code, 0, "{}", passwd_result.stderr);
+    assert_eq!(passwd_result.stdout, "password updated\n");
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(config_path_for_home(home.path())).unwrap())
+            .unwrap();
+    assert_eq!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("mustChangePassword"))
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+
+    let allowed_list = run_cli(&["list"], &home_envs(&home), "", None);
+    assert_eq!(allowed_list.code, 0, "{}", allowed_list.stderr);
+    assert_eq!(allowed_list.stdout, "no projects\n");
 }
 
 #[cfg(target_os = "macos")]
@@ -614,6 +806,62 @@ fn init_stores_unlisted_visibility_and_prints_preview() {
 }
 
 #[test]
+fn init_still_saves_site_config_when_metadata_is_unavailable() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("GET", "/v1/meta") => StubResponse::text(503, r#"{"error":"unavailable"}"#),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    let result = run_cli(
+        &[
+            "init",
+            "--api-base",
+            &server.api_base,
+            "--slug",
+            "my-site",
+            "--publish-dir",
+            "public",
+        ],
+        &home_envs(&home),
+        "\n",
+        Some(project.path()),
+    );
+
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(result.stderr, "");
+    assert!(result.stdout.contains("saved .cfsurge.json"));
+    assert!(!result.stdout.contains("public URL preview"));
+
+    let site_config = fs::read_to_string(site_config_path_for_dir(project.path())).unwrap();
+    assert!(site_config.contains(r#""slug": "my-site""#));
+    assert!(site_config.contains(r#""publishDir": "public""#));
+    assert!(site_config.contains(r#""visibility": "public""#));
+}
+
+#[test]
+fn init_fails_with_clear_error_when_prompted_api_base_is_invalid() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let result = run_cli(
+        &["init", "--slug", "my-site", "--publish-dir", "."],
+        &home_envs(&home),
+        "not-a-url\n",
+        Some(project.path()),
+    );
+
+    assert_eq!(result.code, 1);
+    assert!(result.stdout.contains("API base URL: "));
+    assert!(result.stderr.contains(
+        "invalid API base URL: expected absolute http(s) URL like https://api.example.com"
+    ));
+}
+
+#[test]
 fn publish_uses_site_config_defaults() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
@@ -666,6 +914,68 @@ fn publish_uses_site_config_defaults() {
         requests[1].content_type.as_deref(),
         Some("text/html; charset=utf-8")
     );
+}
+
+#[test]
+fn publish_explicit_args_override_site_config() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/slug-override/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-2","publicUrl":"https://slug-override.example.test","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/slug-override/deployments/dep-2/files/index.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            ("PUT", "/v1/projects/slug-override/deployments/dep-2/files/index.html") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("POST", "/v1/projects/slug-override/deployments/dep-2/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "config-dir");
+    let explicit_dir = create_site_directory(project.path(), "explicit-dir");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"config-slug\",\n  \"publishDir\": \"config-dir\",\n  \"visibility\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &[
+            "publish",
+            explicit_dir.to_str().unwrap(),
+            "--slug",
+            "slug-override",
+        ],
+        &home_envs(&home),
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "published slug-override -> https://slug-override.example.test\n"
+    );
+
+    let requests = server.recorded();
+    assert_eq!(
+        requests[0].url,
+        "/v1/projects/slug-override/deployments/prepare"
+    );
+    assert!(requests[0].body.contains(r#""visibility":"public""#));
 }
 
 #[test]
@@ -797,6 +1107,80 @@ fn remove_uses_site_config_slug_by_default() {
 }
 
 #[test]
+fn remove_explicit_slug_overrides_site_config_slug() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server =
+        start_stub_server(
+            |_, request| match (request.method.as_str(), request.url.as_str()) {
+                ("DELETE", "/v1/projects/arg-slug") => StubResponse::json(r#"{"ok":true}"#),
+                _ => StubResponse::text(404, "not found"),
+            },
+        );
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-remove\"\n}}\n",
+            server.api_base
+        ),
+    );
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"config-slug\",\n  \"publishDir\": \".\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &["remove", "arg-slug"],
+        &home_envs(&home),
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(result.stdout, "removed arg-slug\n");
+
+    let requests = server.recorded();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, "/v1/projects/arg-slug");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer token-remove")
+    );
+}
+
+#[test]
+fn remove_reserves_api_host_first_label_from_configured_api_base() {
+    let home = TempDir::new().unwrap();
+    write_config(
+        home.path(),
+        "{\n  \"apiBase\": \"https://manage.example.test\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-remove\"\n}\n",
+    );
+
+    let result = run_cli(&["remove", "manage"], &home_envs(&home), "", None);
+    assert_eq!(result.code, 1);
+    assert_eq!(result.stdout, "");
+    assert!(
+        result
+            .stderr
+            .contains("invalid slug: manage (reserved_slug)")
+    );
+}
+
+#[test]
+fn remove_reserves_unlisted_host_label() {
+    let home = TempDir::new().unwrap();
+    write_config(
+        home.path(),
+        "{\n  \"apiBase\": \"https://api.example.test\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-remove\"\n}\n",
+    );
+
+    let result = run_cli(&["remove", "u"], &home_envs(&home), "", None);
+    assert_eq!(result.code, 1);
+    assert_eq!(result.stdout, "");
+    assert!(result.stderr.contains("invalid slug: u (reserved_slug)"));
+}
+
+#[test]
 fn list_prints_visibility_and_fallbacks() {
     let home = TempDir::new().unwrap();
     let server = start_stub_server(|_, request| {
@@ -821,6 +1205,144 @@ fn list_prints_visibility_and_fallbacks() {
         result.stdout,
         "public-site\tpublic\thttps://public-site.example.test\tdep-1\t2026-03-23T00:00:00.000Z\tcf-token:a\nlegacy\tpublic\thttps://legacy.example.test\t-\t-\t-\n"
     );
+}
+
+#[test]
+fn admin_users_commands_call_expected_endpoints() {
+    let home = TempDir::new().unwrap();
+    let server = start_stub_server(|_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("GET", "/v1/admin/users") => StubResponse::json(
+                r#"{"users":[{"username":"alice","role":"admin","status":"active","mustChangePassword":false},{"username":"bob","role":"user","status":"disabled","mustChangePassword":true}]}"#,
+            ),
+            ("POST", "/v1/admin/users") => {
+                let body: Value = serde_json::from_str(&request.body).unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({
+                        "username": "charlie",
+                        "role": "user",
+                        "temporaryPassword": "temp-created",
+                    })
+                );
+                StubResponse::json(r#"{"username":"charlie","temporaryPassword":"temp-created"}"#)
+            }
+            ("POST", "/v1/admin/users/charlie/reset-password") => {
+                StubResponse::json(r#"{"temporaryPassword":"temp-reset"}"#)
+            }
+            ("POST", "/v1/admin/users/charlie/disable") => StubResponse::json(r#"{"ok":true}"#),
+            ("POST", "/v1/admin/users/charlie/enable") => StubResponse::json(r#"{"ok":true}"#),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"auth\": {{\n    \"type\": \"service-session\",\n    \"tokenStorage\": \"file\",\n    \"accessToken\": \"admin-session-token\",\n    \"username\": \"alice\",\n    \"role\": \"admin\",\n    \"mustChangePassword\": false\n  }}\n}}\n",
+            server.api_base
+        ),
+    );
+
+    let list_result = run_cli(&["admin", "users", "list"], &home_envs(&home), "", None);
+    assert_eq!(list_result.code, 0, "{}", list_result.stderr);
+    assert_eq!(
+        list_result.stdout,
+        "alice\tadmin\tactive\tno\nbob\tuser\tdisabled\tyes\n"
+    );
+
+    let create_result = run_cli(
+        &[
+            "admin",
+            "users",
+            "create",
+            "--username",
+            "charlie",
+            "--temporary-password",
+            "temp-created",
+        ],
+        &home_envs(&home),
+        "",
+        None,
+    );
+    assert_eq!(create_result.code, 0, "{}", create_result.stderr);
+    assert_eq!(
+        create_result.stdout,
+        "created user charlie\ntemporary password: temp-created\n"
+    );
+
+    let reset_result = run_cli(
+        &["admin", "users", "reset-password", "charlie"],
+        &home_envs(&home),
+        "",
+        None,
+    );
+    assert_eq!(reset_result.code, 0, "{}", reset_result.stderr);
+    assert_eq!(
+        reset_result.stdout,
+        "reset password for charlie\ntemporary password: temp-reset\n"
+    );
+
+    let disable_result = run_cli(
+        &["admin", "users", "disable", "charlie"],
+        &home_envs(&home),
+        "",
+        None,
+    );
+    assert_eq!(disable_result.code, 0, "{}", disable_result.stderr);
+    assert_eq!(disable_result.stdout, "disabled user charlie\n");
+
+    let enable_result = run_cli(
+        &["admin", "users", "enable", "charlie"],
+        &home_envs(&home),
+        "",
+        None,
+    );
+    assert_eq!(enable_result.code, 0, "{}", enable_result.stderr);
+    assert_eq!(enable_result.stdout, "enabled user charlie\n");
+
+    let requests = server.recorded();
+    assert!(requests.len() >= 5);
+    for request in requests {
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some("Bearer admin-session-token")
+        );
+    }
+}
+
+#[test]
+fn logout_revokes_service_session_before_clearing_local_state() {
+    let home = TempDir::new().unwrap();
+    let server =
+        start_stub_server(
+            |_, request| match (request.method.as_str(), request.url.as_str()) {
+                ("POST", "/v1/auth/logout") => StubResponse::json(r#"{"ok":true}"#),
+                _ => StubResponse::text(404, "not found"),
+            },
+        );
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"auth\": {{\n    \"type\": \"service-session\",\n    \"tokenStorage\": \"file\",\n    \"accessToken\": \"session-token-logout\"\n  }}\n}}\n",
+            server.api_base
+        ),
+    );
+
+    let result = run_cli(&["logout"], &home_envs(&home), "", None);
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(result.stdout, "logged out\n");
+
+    let requests = server.recorded();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].url, "/v1/auth/logout");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer session-token-logout")
+    );
+    assert!(!config_path_for_home(home.path()).exists());
 }
 
 #[test]

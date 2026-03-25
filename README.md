@@ -8,6 +8,8 @@
 - 静的ファイルをデプロイして公開 URL を発行
 - 公開中プロジェクトの一覧表示 (`list`)
 - プロジェクト削除 (`remove`) とログアウト (`logout`)
+- サービスユーザーのパスワード変更 (`passwd`)
+- 管理者向けユーザー管理 (`admin users ...`)
 - 公開形態の選択:
   - `public`: 通常公開
   - `unlisted`: 共有 URL を知っている人のみアクセス
@@ -40,19 +42,26 @@ cargo build --release
 cfsurge login
 ```
 
-初回は次のように尋ねられます。
+既定では `service-session` モードでログインします。初回は次のように尋ねられます。
 
 - `API base URL:`
-- `Cloudflare API token:`
+- `Username:`
+- `Password:`
 
-成功すると `logged in as ...` が表示されます。  
-トークン未指定時は、作成用 URL も表示されます。
-
-`--api-base` と `--token` で非対話実行も可能です。
+成功すると `logged in as ...` が表示されます。
 
 ```bash
-cfsurge login --api-base https://api.example.com --token <TOKEN>
+cfsurge login --api-base https://api.example.com --username <USERNAME> --password <PASSWORD>
 ```
+
+Cloudflare API token を指定すると、`cloudflare-admin` モードが自動選択されます。
+明示する場合は次のように実行できます。
+
+```bash
+cfsurge login --api-base https://api.example.com --auth cloudflare-admin --token <TOKEN>
+```
+
+トークン未指定の `cloudflare-admin` ログインでは、トークン作成用 URL と `Cloudflare API token:` プロンプトが表示されます。
 
 ### 2) プロジェクト設定を作成
 
@@ -96,16 +105,23 @@ cfsurge publish dist --slug my-site
 ## コマンド一覧
 
 ```text
-login [--api-base <url>] [--token <token>] [--token-storage <file|keychain>]
+login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--token <token>] [--token-storage <file|keychain>]
 init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]
 publish [dir] [--slug <slug>]
 --version
 list
 remove [slug]
+passwd [--current-password <password>] [--new-password <password>]
+admin users list
+admin users create --username <username> [--role <user|admin>] [--temporary-password <password>]
+admin users reset-password <username>
+admin users disable <username>
+admin users enable <username>
 logout
 ```
 
-`login` の既定保存先は `file` で、`--token-storage keychain` を明示した場合のみ macOS Keychain を利用します。
+`login` の既定保存先は `file` で、`--token-storage keychain` を明示した場合のみ macOS Keychain を利用します。  
+`passwd` は `service-session` ログイン時のみ利用できます。
 
 `list` は TSV 形式で 1 行ずつ出力します。
 
@@ -122,8 +138,14 @@ logout
 保存される主なキー:
 
 - `apiBase`
-- `tokenStorage`
-- `token` (`tokenStorage=file` のとき)
+- `auth.type` (`service-session` または `cloudflare-admin`)
+- `auth.tokenStorage`
+- `auth.accessToken` (`tokenStorage=file` のとき)
+- `auth.actor`
+- `auth.username`
+- `auth.role`
+- `auth.mustChangePassword`
+- `tokenStorage` と `token` (旧形式。`cloudflare-admin` 互換のため併存)
 
 ### プロジェクト設定
 
@@ -139,6 +161,8 @@ logout
 
 - `CFSURGE_API_BASE`: API base URL を上書き
 - `CFSURGE_TOKEN`: API token を上書き
+- `CFSURGE_USERNAME`: `service-session` ログインの username を上書き
+- `CFSURGE_PASSWORD`: `service-session` ログインの password を上書き
 - `CFSURGE_CLI_VERSION`: `--version` 表示値の注入用 (主にビルド/リリース用途)
 
 ## トラブルシュート
@@ -153,3 +177,7 @@ logout
   `publishDir` (または `publish` で指定したディレクトリ) に配信ファイルがあるか確認してください。
 - `invalid visibility: expected public or unlisted`  
   `--visibility` は `public` か `unlisted` のみ指定できます。
+- `password change required. Run cfsurge passwd.`  
+  `service-session` ログイン後に初回変更が必須な状態です。`cfsurge passwd` を実行してください。
+- `token-based login requires --auth cloudflare-admin`  
+  `--token` または `CFSURGE_TOKEN` を使うと、通常は `cloudflare-admin` が自動選択されます。`--auth service-session` を明示しつつ token を指定した場合にこのエラーになります。

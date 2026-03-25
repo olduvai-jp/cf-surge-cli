@@ -111,6 +111,8 @@ fn run_cli(args: &[&str], env: &[(&str, &str)], stdin_text: Option<&str>) -> std
     command.args(args);
     command.env_remove("CFSURGE_API_BASE");
     command.env_remove("CFSURGE_TOKEN");
+    command.env_remove("CFSURGE_USERNAME");
+    command.env_remove("CFSURGE_PASSWORD");
     command.env_remove("CFSURGE_CLI_VERSION");
     for (key, value) in env {
         command.env(key, value);
@@ -147,7 +149,7 @@ fn login_reads_token_from_second_prompt_line() {
     let home = temp_home.path().to_string_lossy().to_string();
     let stdin_payload = format!("{}\ntoken-two-step\n", server.api_base);
     let output = run_cli(
-        &["login"],
+        &["login", "--auth", "cloudflare-admin"],
         &[
             ("HOME", &home),
             ("USERPROFILE", &home),
@@ -397,7 +399,13 @@ fn login_without_token_uses_metadata_token_creation_url() {
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path().to_string_lossy().to_string();
     let output = run_cli(
-        &["login", "--api-base", &server.api_base],
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--auth",
+            "cloudflare-admin",
+        ],
         &[
             ("HOME", &home),
             ("USERPROFILE", &home),
@@ -460,7 +468,13 @@ fn login_without_token_falls_back_to_generic_token_url_when_metadata_fails() {
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path().to_string_lossy().to_string();
     let output = run_cli(
-        &["login", "--api-base", &server.api_base],
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--auth",
+            "cloudflare-admin",
+        ],
         &[
             ("HOME", &home),
             ("USERPROFILE", &home),
@@ -477,4 +491,213 @@ fn login_without_token_falls_back_to_generic_token_url_when_metadata_fails() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("https://dash.cloudflare.com/profile/api-tokens"));
+}
+
+#[test]
+fn login_uses_username_password_from_env_when_flags_missing() {
+    let server = StubServerGuard::start(|method, url, body| {
+        if *method == Method::Post && url == "/v1/auth/login" {
+            let payload: Value = serde_json::from_str(body).expect("valid json payload");
+            assert_eq!(
+                payload,
+                serde_json::json!({
+                    "username": "env-user",
+                    "password": "env-pass",
+                })
+            );
+            return StubResponse {
+                status: 200,
+                body: r#"{"accessToken":"session-token-env","actor":"env-user","username":"env-user","mustChangePassword":false}"#
+                    .to_string(),
+            };
+        }
+        StubResponse {
+            status: 404,
+            body: "not found".to_string(),
+        }
+    });
+
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path().to_string_lossy().to_string();
+    let output = run_cli(
+        &["login", "--api-base", &server.api_base],
+        &[
+            ("HOME", &home),
+            ("USERPROFILE", &home),
+            ("PATH", "/nonexistent"),
+            ("CFSURGE_USERNAME", "env-user"),
+            ("CFSURGE_PASSWORD", "env-pass"),
+        ],
+        None,
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "logged in as env-user\n"
+    );
+}
+
+#[test]
+fn login_flags_override_username_password_env() {
+    let server = StubServerGuard::start(|method, url, body| {
+        if *method == Method::Post && url == "/v1/auth/login" {
+            let payload: Value = serde_json::from_str(body).expect("valid json payload");
+            assert_eq!(
+                payload,
+                serde_json::json!({
+                    "username": "flag-user",
+                    "password": "flag-pass",
+                })
+            );
+            return StubResponse {
+                status: 200,
+                body: r#"{"accessToken":"session-token-flag","actor":"flag-user","username":"flag-user","mustChangePassword":false}"#
+                    .to_string(),
+            };
+        }
+        StubResponse {
+            status: 404,
+            body: "not found".to_string(),
+        }
+    });
+
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path().to_string_lossy().to_string();
+    let output = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &server.api_base,
+            "--username",
+            "flag-user",
+            "--password",
+            "flag-pass",
+        ],
+        &[
+            ("HOME", &home),
+            ("USERPROFILE", &home),
+            ("PATH", "/nonexistent"),
+            ("CFSURGE_USERNAME", "env-user"),
+            ("CFSURGE_PASSWORD", "env-pass"),
+        ],
+        None,
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "logged in as flag-user\n"
+    );
+}
+
+#[test]
+fn login_accepts_auth_alias_values() {
+    let service_server = StubServerGuard::start(|method, url, body| {
+        if *method == Method::Post && url == "/v1/auth/login" {
+            let payload: Value = serde_json::from_str(body).expect("valid json payload");
+            assert_eq!(
+                payload,
+                serde_json::json!({
+                    "username": "alias-user",
+                    "password": "alias-pass",
+                })
+            );
+            return StubResponse {
+                status: 200,
+                body: r#"{"accessToken":"session-token-alias","actor":"alias-user","username":"alias-user","mustChangePassword":false}"#
+                    .to_string(),
+            };
+        }
+        StubResponse {
+            status: 404,
+            body: "not found".to_string(),
+        }
+    });
+    let service_home = TempDir::new().expect("temp home");
+    let service_home_path = service_home.path().to_string_lossy().to_string();
+    let service_output = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &service_server.api_base,
+            "--auth",
+            "service",
+            "--username",
+            "alias-user",
+            "--password",
+            "alias-pass",
+        ],
+        &[
+            ("HOME", &service_home_path),
+            ("USERPROFILE", &service_home_path),
+            ("PATH", "/nonexistent"),
+        ],
+        None,
+    );
+    assert!(
+        service_output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&service_output.stderr)
+    );
+    let service_requests = service_server.requests();
+    assert_eq!(service_requests.len(), 1);
+    assert_eq!(service_requests[0].url, "/v1/auth/login");
+
+    let cloudflare_server = StubServerGuard::start(|method, url, _body| {
+        if *method == Method::Get && url == "/v1/meta" {
+            return StubResponse {
+                status: 200,
+                body: r#"{"apiBase":"http://127.0.0.1:1","publicSuffix":"example.test","tokenCreationUrl":null}"#
+                    .to_string(),
+            };
+        }
+        if *method == Method::Post && url == "/v1/auth/verify" {
+            return StubResponse {
+                status: 200,
+                body: r#"{"ok":true,"actor":"cf-token:alias"}"#.to_string(),
+            };
+        }
+        StubResponse {
+            status: 404,
+            body: "not found".to_string(),
+        }
+    });
+    let cloudflare_home = TempDir::new().expect("temp home");
+    let cloudflare_home_path = cloudflare_home.path().to_string_lossy().to_string();
+    let cloudflare_output = run_cli(
+        &[
+            "login",
+            "--api-base",
+            &cloudflare_server.api_base,
+            "--auth",
+            "cloudflare",
+            "--token",
+            "alias-token",
+        ],
+        &[
+            ("HOME", &cloudflare_home_path),
+            ("USERPROFILE", &cloudflare_home_path),
+            ("PATH", "/nonexistent"),
+        ],
+        None,
+    );
+    assert!(
+        cloudflare_output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&cloudflare_output.stderr)
+    );
+    let cloudflare_requests = cloudflare_server.requests();
+    assert_eq!(cloudflare_requests.len(), 2);
+    assert_eq!(cloudflare_requests[1].url, "/v1/auth/verify");
 }
