@@ -630,8 +630,9 @@ fn change_password(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    update_stored_must_change_password(false)?;
+    finalize_password_change_local_auth_state()?;
     println!("password updated");
+    println!("session revoked. Run cfsurge login");
     Ok(())
 }
 
@@ -1134,7 +1135,7 @@ fn write_config_file(config: &StoredConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn update_stored_must_change_password(value: bool) -> Result<(), String> {
+fn finalize_password_change_local_auth_state() -> Result<(), String> {
     let Some(mut stored) = read_stored_config_if_exists()? else {
         return Ok(());
     };
@@ -1144,8 +1145,22 @@ fn update_stored_must_change_password(value: bool) -> Result<(), String> {
     if auth.auth_type != AuthType::ServiceSession {
         return Ok(());
     }
-    auth.must_change_password = Some(value);
+
+    let token_storage = auth.token_storage.or(stored.token_storage);
+    if token_storage == Some(TokenStorage::Keychain)
+        && can_use_mac_keychain()
+        && let Err(error) = delete_token_from_mac_keychain()
+    {
+        eprintln!(
+            "warning: failed to clear token from macOS Keychain ({})",
+            error
+        );
+    }
+
+    auth.must_change_password = Some(false);
+    auth.access_token = None;
     stored.auth = Some(auth);
+    stored.token = None;
     write_config_file(&stored)
 }
 

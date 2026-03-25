@@ -491,7 +491,10 @@ fn must_change_password_blocks_commands_until_passwd() {
         None,
     );
     assert_eq!(passwd_result.code, 0, "{}", passwd_result.stderr);
-    assert_eq!(passwd_result.stdout, "password updated\n");
+    assert_eq!(
+        passwd_result.stdout,
+        "password updated\nsession revoked. Run cfsurge login\n"
+    );
 
     let config: Value =
         serde_json::from_str(&fs::read_to_string(config_path_for_home(home.path())).unwrap())
@@ -503,10 +506,85 @@ fn must_change_password_blocks_commands_until_passwd() {
             .and_then(Value::as_bool),
         Some(false)
     );
+    assert!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("accessToken"))
+            .is_none()
+    );
 
-    let allowed_list = run_cli(&["list"], &home_envs(&home), "", None);
-    assert_eq!(allowed_list.code, 0, "{}", allowed_list.stderr);
-    assert_eq!(allowed_list.stdout, "no projects\n");
+    let list_without_relogin = run_cli(&["list"], &home_envs(&home), "", None);
+    assert_eq!(list_without_relogin.code, 1);
+    assert_eq!(list_without_relogin.stdout, "");
+    assert!(list_without_relogin.stderr.contains("Run cfsurge login."));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn passwd_clears_keychain_backed_service_session_token() {
+    let home = TempDir::new().unwrap();
+    let fake_security_root = TempDir::new().unwrap();
+    let (bin_dir, store_path, log_path) = create_fake_security_command(fake_security_root.path());
+    let path_value = match env::var("PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{}:{existing}", bin_dir.display()),
+        _ => bin_dir.display().to_string(),
+    };
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/auth/change-password") => StubResponse::json(r#"{"ok":true}"#),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"auth\": {{\n    \"type\": \"service-session\",\n    \"tokenStorage\": \"keychain\",\n    \"username\": \"bob\",\n    \"mustChangePassword\": true\n  }}\n}}\n",
+            server.api_base
+        ),
+    );
+    fs::write(&store_path, "session-token-keychain").unwrap();
+
+    let result = run_cli(
+        &[
+            "passwd",
+            "--current-password",
+            "temp-pass",
+            "--new-password",
+            "new-pass",
+        ],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", &path_value),
+            ("FAKE_SECURITY_STORE", store_path.to_str().unwrap()),
+            ("FAKE_SECURITY_LOG", log_path.to_str().unwrap()),
+        ],
+        "",
+        None,
+    );
+
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "password updated\nsession revoked. Run cfsurge login\n"
+    );
+    assert_eq!(result.stderr, "");
+    assert!(!store_path.exists());
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(config_path_for_home(home.path())).unwrap())
+            .unwrap();
+    assert!(
+        config
+            .get("auth")
+            .and_then(|auth| auth.get("accessToken"))
+            .is_none()
+    );
+
+    let log = fs::read_to_string(log_path).unwrap();
+    assert!(log.contains("find-generic-password"));
+    assert!(log.contains("delete-generic-password"));
 }
 
 #[cfg(target_os = "macos")]
