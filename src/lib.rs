@@ -8,6 +8,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -1677,24 +1678,50 @@ fn assert_no_deprecated_visibility_flag(args: &[String]) -> Result<(), String> {
 }
 
 fn resolve_basic_auth_from_env() -> Result<BasicAuthPayload, String> {
-    let username = env::var(BASIC_AUTH_USERNAME_ENV)
+    let username_from_env = env::var(BASIC_AUTH_USERNAME_ENV)
         .ok()
         .and_then(|value| read_string(&value))
-        .ok_or_else(|| {
-            format!(
-                "basic publish requires {} and {}",
-                BASIC_AUTH_USERNAME_ENV, BASIC_AUTH_PASSWORD_ENV
-            )
-        })?;
-    let password = env::var(BASIC_AUTH_PASSWORD_ENV)
+        .unwrap_or_default();
+    let password_from_env = env::var(BASIC_AUTH_PASSWORD_ENV)
         .ok()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "basic publish requires {} and {}",
-                BASIC_AUTH_USERNAME_ENV, BASIC_AUTH_PASSWORD_ENV
-            )
-        })?;
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default();
+
+    if !username_from_env.is_empty() && !password_from_env.is_empty() {
+        return validate_basic_auth_credentials(username_from_env, password_from_env);
+    }
+
+    let dotenv_values = read_basic_auth_from_cwd_dotenv()?;
+    let username = if username_from_env.is_empty() {
+        dotenv_values
+            .get(BASIC_AUTH_USERNAME_ENV)
+            .and_then(|value| read_string(value))
+            .unwrap_or_default()
+    } else {
+        username_from_env
+    };
+    let password = if password_from_env.is_empty() {
+        dotenv_values
+            .get(BASIC_AUTH_PASSWORD_ENV)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        password_from_env
+    };
+
+    validate_basic_auth_credentials(username, password)
+}
+
+fn validate_basic_auth_credentials(
+    username: String,
+    password: String,
+) -> Result<BasicAuthPayload, String> {
+    if username.is_empty() || password.is_empty() {
+        return Err(format!(
+            "basic publish requires {} and {}",
+            BASIC_AUTH_USERNAME_ENV, BASIC_AUTH_PASSWORD_ENV
+        ));
+    }
     if !is_valid_basic_username(&username) {
         return Err(
             "invalid basic auth username: expected non-empty printable ASCII without ':'".into(),
@@ -1704,6 +1731,172 @@ fn resolve_basic_auth_from_env() -> Result<BasicAuthPayload, String> {
         return Err("invalid basic auth password: expected non-empty printable ASCII".into());
     }
     Ok(BasicAuthPayload { username, password })
+}
+
+fn read_basic_auth_from_cwd_dotenv() -> Result<HashMap<String, String>, String> {
+    let dotenv_path = env::current_dir()
+        .map_err(|error| error.to_string())?
+        .join(".env");
+    let raw = match fs::read_to_string(dotenv_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(parse_dotenv_for_basic_auth(&raw))
+}
+
+fn parse_dotenv_for_basic_auth(raw: &str) -> HashMap<String, String> {
+    let mut parsed = HashMap::new();
+
+    for line in raw.lines() {
+        let Some((key, value)) = parse_dotenv_line(line) else {
+            continue;
+        };
+        if matches!(
+            key.as_str(),
+            BASIC_AUTH_USERNAME_ENV | BASIC_AUTH_PASSWORD_ENV
+        ) {
+            parsed.insert(key, value);
+        }
+    }
+
+    parsed
+}
+
+fn parse_dotenv_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let equals_index = line.find('=')?;
+    if equals_index == 0 {
+        return None;
+    }
+
+    let mut key = line[..equals_index].trim();
+    if let Some(stripped) = key.strip_prefix("export ") {
+        key = stripped.trim();
+    }
+    if !is_valid_dotenv_key(key) {
+        return None;
+    }
+
+    let value = parse_dotenv_value(&line[equals_index + 1..])?;
+    Some((key.to_string(), value))
+}
+
+fn is_valid_dotenv_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn parse_dotenv_value(raw_value: &str) -> Option<String> {
+    let value = raw_value.trim();
+    if value.is_empty() {
+        return Some(String::new());
+    }
+    if value.starts_with('"') {
+        return parse_double_quoted_dotenv_value(value);
+    }
+    if value.starts_with('\'') {
+        return parse_single_quoted_dotenv_value(value);
+    }
+    Some(strip_trailing_dotenv_comment(value))
+}
+
+fn parse_single_quoted_dotenv_value(value: &str) -> Option<String> {
+    let end_quote_index = value[1..].find('\'')? + 1;
+    let trailing = value[end_quote_index + 1..].trim();
+    if !trailing.is_empty() && !trailing.starts_with('#') {
+        return None;
+    }
+    Some(value[1..end_quote_index].to_string())
+}
+
+fn parse_double_quoted_dotenv_value(value: &str) -> Option<String> {
+    for (index, ch) in value.char_indices().skip(1) {
+        if ch != '"' || is_escaped_dotenv_character(value, index) {
+            continue;
+        }
+
+        let trailing = value[index + 1..].trim();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return None;
+        }
+
+        return Some(unescape_double_quoted_dotenv_value(&value[1..index]));
+    }
+
+    None
+}
+
+fn is_escaped_dotenv_character(value: &str, index: usize) -> bool {
+    let bytes = value.as_bytes();
+    let mut slash_count = 0;
+    let mut cursor = index;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        slash_count += 1;
+        cursor -= 1;
+    }
+    slash_count % 2 == 1
+}
+
+fn unescape_double_quoted_dotenv_value(value: &str) -> String {
+    let mut parsed = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            parsed.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('n') => {
+                parsed.push('\n');
+                chars.next();
+            }
+            Some('r') => {
+                parsed.push('\r');
+                chars.next();
+            }
+            Some('t') => {
+                parsed.push('\t');
+                chars.next();
+            }
+            Some('"') => {
+                parsed.push('"');
+                chars.next();
+            }
+            Some('\\') => {
+                parsed.push('\\');
+                chars.next();
+            }
+            _ => parsed.push('\\'),
+        }
+    }
+
+    parsed
+}
+
+fn strip_trailing_dotenv_comment(value: &str) -> String {
+    let mut previous_char = None;
+
+    for (index, ch) in value.char_indices() {
+        if ch == '#' && (index == 0 || previous_char.is_some_and(char::is_whitespace)) {
+            return value[..index].trim_end().to_string();
+        }
+        previous_char = Some(ch);
+    }
+
+    value.to_string()
 }
 
 fn is_valid_basic_username(value: &str) -> bool {

@@ -1495,6 +1495,357 @@ fn publish_basic_sends_basic_auth_and_prints_served_url() {
 }
 
 #[test]
+fn publish_basic_uses_cwd_dotenv_credentials() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/private-site/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-basic-dotenv","servedUrl":"https://private-site.example.test","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/private-site/deployments/dep-basic-dotenv/files/index.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            ("PUT", "/v1/projects/private-site/deployments/dep-basic-dotenv/files/index.html") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("POST", "/v1/projects/private-site/deployments/dep-basic-dotenv/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"basic\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join(".env"),
+        "# basic auth credentials\nMALFORMED_LINE\nCFSURGE_BASIC_AUTH_USERNAME=\"dotenv-viewer\"\nCFSURGE_BASIC_AUTH_PASSWORD='dotenv-secret'\nIGNORED_KEY=value\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "published private-site -> https://private-site.example.test\n"
+    );
+    assert_eq!(result.stderr, "");
+
+    let requests = server.recorded();
+    assert_eq!(
+        requests[0].url,
+        "/v1/projects/private-site/deployments/prepare"
+    );
+    let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("username"))
+            .and_then(Value::as_str),
+        Some("dotenv-viewer")
+    );
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("password"))
+            .and_then(Value::as_str),
+        Some("dotenv-secret")
+    );
+}
+
+#[test]
+fn publish_basic_prefers_process_env_over_conflicting_dotenv_values() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/private-site/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-basic-env-precedence","servedUrl":"https://private-site.example.test","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/private-site/deployments/dep-basic-env-precedence/files/index.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            (
+                "PUT",
+                "/v1/projects/private-site/deployments/dep-basic-env-precedence/files/index.html",
+            ) => StubResponse::json(r#"{"ok":true}"#),
+            ("POST", "/v1/projects/private-site/deployments/dep-basic-env-precedence/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"basic\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join(".env"),
+        "CFSURGE_BASIC_AUTH_USERNAME=dotenv-user\nCFSURGE_BASIC_AUTH_PASSWORD=dotenv-pass\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &["publish"],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", "/nonexistent"),
+            ("CFSURGE_BASIC_AUTH_USERNAME", "env-user"),
+            ("CFSURGE_BASIC_AUTH_PASSWORD", "env-pass"),
+        ],
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 0, "{}", result.stderr);
+
+    let requests = server.recorded();
+    let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("username"))
+            .and_then(Value::as_str),
+        Some("env-user")
+    );
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("password"))
+            .and_then(Value::as_str),
+        Some("env-pass")
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn publish_basic_succeeds_with_env_only_credentials_when_cwd_dotenv_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/private-site/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-basic-unreadable-dotenv","servedUrl":"https://private-site.example.test","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/private-site/deployments/dep-basic-unreadable-dotenv/files/index.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            (
+                "PUT",
+                "/v1/projects/private-site/deployments/dep-basic-unreadable-dotenv/files/index.html",
+            ) => StubResponse::json(r#"{"ok":true}"#),
+            (
+                "POST",
+                "/v1/projects/private-site/deployments/dep-basic-unreadable-dotenv/activate",
+            ) => StubResponse::json(r#"{"ok":true}"#),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"basic\"\n}\n",
+    )
+    .unwrap();
+
+    let dot_env_path = project.path().join(".env");
+    fs::write(
+        &dot_env_path,
+        "CFSURGE_BASIC_AUTH_USERNAME=dotenv-user\nCFSURGE_BASIC_AUTH_PASSWORD=dotenv-pass\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&dot_env_path).unwrap().permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&dot_env_path, permissions).unwrap();
+
+    let result = run_cli(
+        &["publish"],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", "/nonexistent"),
+            ("CFSURGE_BASIC_AUTH_USERNAME", "env-user"),
+            ("CFSURGE_BASIC_AUTH_PASSWORD", "env-pass"),
+        ],
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 0, "{}", result.stderr);
+
+    let requests = server.recorded();
+    let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("username"))
+            .and_then(Value::as_str),
+        Some("env-user")
+    );
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("password"))
+            .and_then(Value::as_str),
+        Some("env-pass")
+    );
+}
+
+#[test]
+fn publish_basic_allows_mixed_process_env_and_dotenv_sources() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/private-site/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-basic-mixed","servedUrl":"https://private-site.example.test","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/private-site/deployments/dep-basic-mixed/files/index.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            ("PUT", "/v1/projects/private-site/deployments/dep-basic-mixed/files/index.html") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("POST", "/v1/projects/private-site/deployments/dep-basic-mixed/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"basic\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join(".env"),
+        "CFSURGE_BASIC_AUTH_PASSWORD=dotenv-only-pass\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &["publish"],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", "/nonexistent"),
+            ("CFSURGE_BASIC_AUTH_USERNAME", "env-only-user"),
+        ],
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 0, "{}", result.stderr);
+
+    let requests = server.recorded();
+    let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("username"))
+            .and_then(Value::as_str),
+        Some("env-only-user")
+    );
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("password"))
+            .and_then(Value::as_str),
+        Some("dotenv-only-pass")
+    );
+}
+
+#[test]
+fn publish_basic_does_not_use_dotenv_outside_cwd() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let publish_root = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/private-site/deployments/prepare") => {
+                StubResponse::json(r#"{"unexpected":"prepare-called"}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    let publish_dir = create_site_directory(publish_root.path(), "public");
+    fs::write(
+        publish_root.path().join(".env"),
+        "CFSURGE_BASIC_AUTH_USERNAME=viewer\nCFSURGE_BASIC_AUTH_PASSWORD=secret\n",
+    )
+    .unwrap();
+    fs::write(
+        site_config_path_for_dir(cwd.path()),
+        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"ignored\",\n  \"access\": \"basic\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &[
+            "publish",
+            publish_dir.to_str().unwrap(),
+            "--slug",
+            "private-site",
+        ],
+        &home_envs(&home),
+        "",
+        Some(cwd.path()),
+    );
+    assert_eq!(result.code, 1);
+    assert!(result.stderr.contains(
+        "basic publish requires CFSURGE_BASIC_AUTH_USERNAME and CFSURGE_BASIC_AUTH_PASSWORD"
+    ));
+    assert!(server.recorded().is_empty());
+}
+
+#[test]
 fn publish_rejects_invalid_basic_auth_username() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
