@@ -14,6 +14,10 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use urlencoding::encode;
 use walkdir::WalkDir;
 
@@ -31,6 +35,13 @@ const MAX_SLUG_LENGTH: usize = 63;
 const FALLBACK_API_RESERVED_LABEL: &str = "api";
 const ALWAYS_RESERVED_LABEL: &str = "www";
 const UNLISTED_FALLBACK_LABEL: &str = "u";
+const PUBLISH_PROGRESS_SCANNING_MAX_PERCENT: u8 = 10;
+const PUBLISH_PROGRESS_PREPARE_WEIGHT: u8 = 15;
+const PUBLISH_PROGRESS_UPLOAD_WEIGHT: u8 = 75;
+const PUBLISH_PROGRESS_ACTIVATE_PERCENT: u8 = 90;
+const PUBLISH_PROGRESS_COMPLETE_PERCENT: u8 = 100;
+const PUBLISH_SPINNER_INTERVAL_MS: u64 = 100;
+const PUBLISH_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,6 +145,161 @@ struct SelectOption<T> {
     value: T,
     label: &'static str,
     description: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishProgressPhase {
+    Scanning,
+    Preparing,
+    Uploading,
+    Activating,
+    Complete,
+}
+
+impl PublishProgressPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Scanning => "scanning",
+            Self::Preparing => "preparing",
+            Self::Uploading => "uploading",
+            Self::Activating => "activating",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PublishProgressState {
+    phase: PublishProgressPhase,
+    completed_uploads: usize,
+    total_uploads: usize,
+    scanned_files: usize,
+    total_files: usize,
+}
+
+impl PublishProgressState {
+    fn initial() -> Self {
+        Self {
+            phase: PublishProgressPhase::Scanning,
+            completed_uploads: 0,
+            total_uploads: 0,
+            scanned_files: 0,
+            total_files: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CollectFilesProgress {
+    processed_files: usize,
+    total_files: usize,
+}
+
+struct PublishProgressReporter {
+    is_tty: bool,
+    spinner: Option<PublishSpinner>,
+    last_percent: u8,
+}
+
+impl PublishProgressReporter {
+    fn new(is_tty: bool) -> Self {
+        Self {
+            is_tty,
+            spinner: is_tty.then(PublishSpinner::new),
+            last_percent: 0,
+        }
+    }
+
+    fn update(&mut self, state: PublishProgressState) {
+        if self.is_tty {
+            if let Some(spinner) = self.spinner.as_ref() {
+                spinner.update(state);
+            }
+            return;
+        }
+
+        let percent = calculate_publish_progress_percent(state, &mut self.last_percent);
+        eprintln!("{}", build_publish_progress_message(percent, state));
+    }
+
+    fn stop(&mut self) {
+        if let Some(spinner) = self.spinner.as_mut() {
+            spinner.stop();
+        }
+        self.spinner = None;
+    }
+}
+
+struct PublishSpinner {
+    shared: Arc<Mutex<PublishSpinnerState>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+struct PublishSpinnerState {
+    state: PublishProgressState,
+    last_percent: u8,
+    frame_index: usize,
+    line_active: bool,
+}
+
+impl PublishSpinner {
+    fn new() -> Self {
+        let shared = Arc::new(Mutex::new(PublishSpinnerState {
+            state: PublishProgressState::initial(),
+            last_percent: 0,
+            frame_index: 0,
+            line_active: false,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_shared = Arc::clone(&shared);
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                {
+                    let mut state = thread_shared.lock().unwrap();
+                    let frame = PUBLISH_SPINNER_FRAMES[state.frame_index];
+                    state.frame_index = (state.frame_index + 1) % PUBLISH_SPINNER_FRAMES.len();
+                    let percent =
+                        calculate_publish_progress_percent(state.state, &mut state.last_percent);
+                    let message = build_publish_progress_message(percent, state.state);
+                    eprint!("\r\x1B[2K{frame} {message}");
+                    let _ = io::stderr().flush();
+                    state.line_active = true;
+                }
+                thread::sleep(Duration::from_millis(PUBLISH_SPINNER_INTERVAL_MS));
+            }
+        });
+
+        Self {
+            shared,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn update(&self, state: PublishProgressState) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.state = state;
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let line_active = self
+            .shared
+            .lock()
+            .map(|state| state.line_active)
+            .unwrap_or(false);
+        if line_active {
+            eprint!("\r\x1B[2K\n");
+            let _ = io::stderr().flush();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -436,88 +602,161 @@ fn publish(args: &[String]) -> Result<(), String> {
     };
 
     let absolute_dir = fs::canonicalize(&directory).map_err(|error| error.to_string())?;
-    let files = collect_files(&absolute_dir)?;
-    if files.is_empty() {
-        return Err("publish target has no files".into());
-    }
-    let prepare_body = if let Some(basic_auth) = basic_auth {
-        serde_json::json!({
-            "files": files,
-            "access": access.as_str(),
-            "basicAuth": basic_auth,
-        })
-    } else {
-        serde_json::json!({
-            "files": files,
-            "access": access.as_str(),
-        })
-    };
+    let mut progress = PublishProgressReporter::new(io::stderr().is_terminal());
+    let publish_result = (|| -> Result<String, String> {
+        progress.update(PublishProgressState::initial());
 
-    let client = Client::new();
-    let prepare_response = client
-        .post(format!(
-            "{}/v1/projects/{}/deployments/prepare",
-            config.api_base,
-            encode(&slug)
-        ))
-        .headers(auth_headers(&config.token)?)
-        .json(&prepare_body)
-        .send()
-        .map_err(format_http_error)?;
+        let mut last_scanning_percent = None;
+        let files = collect_files(
+            &absolute_dir,
+            Some(|value: CollectFilesProgress| {
+                let scanning_percent =
+                    calculate_scanning_percent(value.processed_files, value.total_files);
+                if last_scanning_percent == Some(scanning_percent)
+                    && value.processed_files != value.total_files
+                {
+                    return;
+                }
+                last_scanning_percent = Some(scanning_percent);
+                progress.update(PublishProgressState {
+                    phase: PublishProgressPhase::Scanning,
+                    completed_uploads: 0,
+                    total_uploads: 0,
+                    scanned_files: value.processed_files,
+                    total_files: value.total_files,
+                });
+            }),
+        )?;
 
-    if !prepare_response.status().is_success() {
-        return Err(format!(
-            "prepare failed: {}",
-            prepare_response.text().unwrap_or_default()
-        ));
-    }
-
-    let prepared = prepare_response
-        .json::<PrepareResponse>()
-        .map_err(format_http_error)?;
-
-    for upload in &prepared.upload_urls {
-        let file = files
-            .iter()
-            .find(|entry| entry.path == upload.path)
-            .ok_or_else(|| format!("missing file descriptor for {}", upload.path))?;
-        let body = fs::read(absolute_dir.join(&upload.path)).map_err(|error| error.to_string())?;
-        let mut request = client.put(&upload.url);
-        request = request.header(CONTENT_TYPE, &file.content_type);
-        if should_attach_api_auth(&upload.url, &config.api_base) {
-            request = request.header(AUTHORIZATION, format!("Bearer {}", config.token));
+        if files.is_empty() {
+            return Err("publish target has no files".into());
         }
-        let upload_response = request.body(body).send().map_err(format_http_error)?;
-        if !upload_response.status().is_success() {
+
+        progress.update(PublishProgressState {
+            phase: PublishProgressPhase::Preparing,
+            completed_uploads: 0,
+            total_uploads: 0,
+            scanned_files: files.len(),
+            total_files: files.len(),
+        });
+
+        let prepare_body = if let Some(basic_auth) = basic_auth.as_ref() {
+            serde_json::json!({
+                "files": files,
+                "access": access.as_str(),
+                "basicAuth": basic_auth,
+            })
+        } else {
+            serde_json::json!({
+                "files": files,
+                "access": access.as_str(),
+            })
+        };
+
+        let client = Client::new();
+        let prepare_response = client
+            .post(format!(
+                "{}/v1/projects/{}/deployments/prepare",
+                config.api_base,
+                encode(&slug)
+            ))
+            .headers(auth_headers(&config.token)?)
+            .json(&prepare_body)
+            .send()
+            .map_err(format_http_error)?;
+
+        if !prepare_response.status().is_success() {
             return Err(format!(
-                "upload failed for {}: {}",
-                upload.path,
-                upload_response.text().unwrap_or_default()
+                "prepare failed: {}",
+                prepare_response.text().unwrap_or_default()
             ));
         }
-    }
 
-    let activate_response = client
-        .post(format!(
-            "{}/v1/projects/{}/deployments/{}/activate",
-            config.api_base,
-            encode(&slug),
-            encode(&prepared.deployment_id)
-        ))
-        .headers(auth_headers(&config.token)?)
-        .send()
-        .map_err(format_http_error)?;
+        let prepared = prepare_response
+            .json::<PrepareResponse>()
+            .map_err(format_http_error)?;
+        let total_uploads = prepared.upload_urls.len();
+        let mut completed_uploads = 0usize;
 
-    if !activate_response.status().is_success() {
-        return Err(format!(
-            "activate failed: {}",
-            activate_response.text().unwrap_or_default()
-        ));
-    }
+        progress.update(PublishProgressState {
+            phase: PublishProgressPhase::Uploading,
+            completed_uploads,
+            total_uploads,
+            scanned_files: files.len(),
+            total_files: files.len(),
+        });
 
-    let served_url = read_string_opt(prepared.served_url.as_ref())
-        .or_else(|| read_string_opt(prepared.public_url.as_ref()))
-        .ok_or_else(|| "prepare failed: missing servedUrl/publicUrl in response".to_string())?;
+        for upload in &prepared.upload_urls {
+            let file = files
+                .iter()
+                .find(|entry| entry.path == upload.path)
+                .ok_or_else(|| format!("missing file descriptor for {}", upload.path))?;
+            let body =
+                fs::read(absolute_dir.join(&upload.path)).map_err(|error| error.to_string())?;
+            let mut request = client.put(&upload.url);
+            request = request.header(CONTENT_TYPE, &file.content_type);
+            if should_attach_api_auth(&upload.url, &config.api_base) {
+                request = request.header(AUTHORIZATION, format!("Bearer {}", config.token));
+            }
+            let upload_response = request.body(body).send().map_err(format_http_error)?;
+            if !upload_response.status().is_success() {
+                return Err(format!(
+                    "upload failed for {}: {}",
+                    upload.path,
+                    upload_response.text().unwrap_or_default()
+                ));
+            }
+            completed_uploads += 1;
+            progress.update(PublishProgressState {
+                phase: PublishProgressPhase::Uploading,
+                completed_uploads,
+                total_uploads,
+                scanned_files: files.len(),
+                total_files: files.len(),
+            });
+        }
+
+        progress.update(PublishProgressState {
+            phase: PublishProgressPhase::Activating,
+            completed_uploads,
+            total_uploads,
+            scanned_files: files.len(),
+            total_files: files.len(),
+        });
+
+        let activate_response = client
+            .post(format!(
+                "{}/v1/projects/{}/deployments/{}/activate",
+                config.api_base,
+                encode(&slug),
+                encode(&prepared.deployment_id)
+            ))
+            .headers(auth_headers(&config.token)?)
+            .send()
+            .map_err(format_http_error)?;
+
+        if !activate_response.status().is_success() {
+            return Err(format!(
+                "activate failed: {}",
+                activate_response.text().unwrap_or_default()
+            ));
+        }
+
+        let served_url = read_string_opt(prepared.served_url.as_ref())
+            .or_else(|| read_string_opt(prepared.public_url.as_ref()))
+            .ok_or_else(|| "prepare failed: missing servedUrl/publicUrl in response".to_string())?;
+        progress.update(PublishProgressState {
+            phase: PublishProgressPhase::Complete,
+            completed_uploads,
+            total_uploads,
+            scanned_files: files.len(),
+            total_files: files.len(),
+        });
+        Ok(served_url)
+    })();
+    progress.stop();
+
+    let served_url = publish_result?;
     println!("published {slug} -> {served_url}");
     Ok(())
 }
@@ -1369,21 +1608,83 @@ fn delete_token_from_mac_keychain() -> Result<(), String> {
     Err(stderr.trim().to_string())
 }
 
-fn collect_files(root_dir: &Path) -> Result<Vec<FileEntry>, String> {
-    let mut files = Vec::new();
+fn build_publish_progress_message(percent: u8, state: PublishProgressState) -> String {
+    if state.phase == PublishProgressPhase::Scanning {
+        return format!(
+            "publish: {percent}% (scanned {}/{} files) scanning",
+            state.scanned_files, state.total_files
+        );
+    }
+    format!(
+        "publish: {percent}% ({}/{} uploads) {}",
+        state.completed_uploads,
+        state.total_uploads,
+        state.phase.as_str()
+    )
+}
+
+fn calculate_scanning_percent(scanned_files: usize, total_files: usize) -> u8 {
+    if total_files == 0 {
+        return 0;
+    }
+    let bounded_scanned_files = scanned_files.min(total_files);
+    ((bounded_scanned_files as u32 * PUBLISH_PROGRESS_SCANNING_MAX_PERCENT as u32)
+        / total_files as u32) as u8
+}
+
+fn calculate_publish_progress_percent(state: PublishProgressState, last_percent: &mut u8) -> u8 {
+    let current = match state.phase {
+        PublishProgressPhase::Scanning => {
+            calculate_scanning_percent(state.scanned_files, state.total_files)
+        }
+        PublishProgressPhase::Preparing => PUBLISH_PROGRESS_PREPARE_WEIGHT,
+        PublishProgressPhase::Uploading => {
+            if state.total_uploads == 0 {
+                PUBLISH_PROGRESS_PREPARE_WEIGHT
+            } else {
+                let bounded_completed_uploads = state.completed_uploads.min(state.total_uploads);
+                PUBLISH_PROGRESS_PREPARE_WEIGHT
+                    + ((bounded_completed_uploads as u32 * PUBLISH_PROGRESS_UPLOAD_WEIGHT as u32)
+                        / state.total_uploads as u32) as u8
+            }
+        }
+        PublishProgressPhase::Activating => PUBLISH_PROGRESS_ACTIVATE_PERCENT,
+        PublishProgressPhase::Complete => PUBLISH_PROGRESS_COMPLETE_PERCENT,
+    }
+    .min(100);
+    let monotonic = current.max(*last_percent);
+    *last_percent = monotonic;
+    monotonic
+}
+
+fn collect_files<F>(root_dir: &Path, mut on_progress: Option<F>) -> Result<Vec<FileEntry>, String>
+where
+    F: FnMut(CollectFilesProgress),
+{
+    let mut file_paths = Vec::new();
     for entry in WalkDir::new(root_dir) {
         let entry = entry.map_err(|error| error.to_string())?;
-        if !entry.file_type().is_file() {
-            continue;
+        if entry.file_type().is_file() {
+            file_paths.push(entry.into_path());
         }
-        let absolute_path = entry.into_path();
+    }
+
+    if let Some(callback) = on_progress.as_mut() {
+        callback(CollectFilesProgress {
+            processed_files: 0,
+            total_files: file_paths.len(),
+        });
+    }
+
+    let mut files = Vec::new();
+    for (index, absolute_path) in file_paths.iter().enumerate() {
         let relative_path = absolute_path
             .strip_prefix(root_dir)
             .map_err(|error| error.to_string())?
             .to_string_lossy()
             .replace('\\', "/");
-        let buffer = fs::read(&absolute_path).map_err(|error| error.to_string())?;
-        let size = fs::metadata(&absolute_path)
+        let buffer = fs::read(absolute_path).map_err(|error| error.to_string())?;
+        let size = fs::metadata(absolute_path)
             .map_err(|error| error.to_string())?
             .len();
         let sha256 = hex_digest(&buffer);
@@ -1393,6 +1694,12 @@ fn collect_files(root_dir: &Path) -> Result<Vec<FileEntry>, String> {
             size,
             content_type: guess_content_type(&relative_path).into(),
         });
+        if let Some(callback) = on_progress.as_mut() {
+            callback(CollectFilesProgress {
+                processed_files: index + 1,
+                total_files: file_paths.len(),
+            });
+        }
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)

@@ -99,7 +99,8 @@ cfsurge publish
 cfsurge publish dist --slug my-site
 ```
 
-成功時は `published <slug> -> <url>` が表示されます。
+`publish` の進捗は `stderr` に出力されます。TTY ではスピナー付きで 1 行更新、非 TTY では改行付きログとして出力されます。  
+成功時の最終行 `published <slug> -> <url>` は `stdout` に出力されます。
 
 `access=basic` の場合は `publish` 実行時に毎回、次の環境変数が必須です。
 

@@ -257,6 +257,38 @@ fn home_envs(home: &TempDir) -> [(&str, &str); 3] {
     ]
 }
 
+fn assert_publish_progress_stderr(stderr: &str, total_uploads: usize, total_scanned_files: usize) {
+    let mut expected_lines = vec![
+        "publish: 0% (scanned 0/0 files) scanning".to_string(),
+        format!("publish: 0% (scanned 0/{total_scanned_files} files) scanning"),
+        format!(
+            "publish: 10% (scanned {total_scanned_files}/{total_scanned_files} files) scanning"
+        ),
+        "publish: 15% (0/0 uploads) preparing".to_string(),
+        format!("publish: 15% (0/{total_uploads} uploads) uploading"),
+    ];
+    if total_uploads > 0 {
+        expected_lines.push(format!(
+            "publish: 90% ({total_uploads}/{total_uploads} uploads) uploading"
+        ));
+    }
+    expected_lines.push(format!(
+        "publish: 90% ({total_uploads}/{total_uploads} uploads) activating"
+    ));
+    expected_lines.push(format!(
+        "publish: 100% ({total_uploads}/{total_uploads} uploads) complete"
+    ));
+
+    let mut previous_index = 0usize;
+    for line in expected_lines {
+        let needle = format!("{line}\n");
+        let index = stderr[previous_index..].find(&needle).unwrap_or_else(|| {
+            panic!("missing or out-of-order progress line: {line}\nstderr:\n{stderr}")
+        }) + previous_index;
+        previous_index = index + needle.len();
+    }
+}
+
 #[test]
 fn version_prints_development_fallback() {
     let result = run_cli(&["--version"], &[("CFSURGE_CLI_VERSION", "")], "", None);
@@ -1307,6 +1339,7 @@ fn publish_uses_site_config_defaults() {
         result.stdout,
         "published site-default -> https://site-default.example.test\n"
     );
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
 
     let requests = server.recorded();
     assert_eq!(
@@ -1378,6 +1411,7 @@ fn publish_explicit_args_override_site_config() {
         result.stdout,
         "published slug-override -> https://slug-override.example.test\n"
     );
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
 
     let requests = server.recorded();
     assert_eq!(
@@ -1385,6 +1419,174 @@ fn publish_explicit_args_override_site_config() {
         "/v1/projects/slug-override/deployments/prepare"
     );
     assert!(requests[0].body.contains(r#""access":"public""#));
+}
+
+#[test]
+fn publish_reports_progress_for_multiple_uploads() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/multi-upload/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-multi","publicUrl":"https://multi-upload.example.test","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/multi-upload/deployments/dep-multi/files/index.html"}},{{"path":"styles.css","url":"{}/v1/projects/multi-upload/deployments/dep-multi/files/styles.css"}}]}}"#,
+                    api_base, api_base
+                ))
+            }
+            ("PUT", "/v1/projects/multi-upload/deployments/dep-multi/files/index.html") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("PUT", "/v1/projects/multi-upload/deployments/dep-multi/files/styles.css") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("POST", "/v1/projects/multi-upload/deployments/dep-multi/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    let site_dir = create_site_directory(project.path(), "public");
+    fs::write(site_dir.join("styles.css"), "body{color:#333}").unwrap();
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"multi-upload\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "published multi-upload -> https://multi-upload.example.test\n"
+    );
+    assert_publish_progress_stderr(&result.stderr, 2, 2);
+    assert!(
+        result
+            .stderr
+            .contains("publish: 52% (1/2 uploads) uploading\n")
+    );
+}
+
+#[test]
+fn publish_reports_progress_when_prepare_returns_zero_uploads() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/no-upload/deployments/prepare") => StubResponse::json(
+                r#"{"deploymentId":"dep-no-upload","publicUrl":"https://no-upload.example.test","uploadUrls":[]}"#,
+            ),
+            ("POST", "/v1/projects/no-upload/deployments/dep-no-upload/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"no-upload\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "published no-upload -> https://no-upload.example.test\n"
+    );
+    assert_publish_progress_stderr(&result.stderr, 0, 1);
+
+    let requests = server.recorded();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].url,
+        "/v1/projects/no-upload/deployments/prepare"
+    );
+    assert_eq!(
+        requests[1].url,
+        "/v1/projects/no-upload/deployments/dep-no-upload/activate"
+    );
+}
+
+#[test]
+fn publish_upload_failure_includes_progress_and_error() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/failing-upload/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-fail","publicUrl":"https://failing-upload.example.test","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/failing-upload/deployments/dep-fail/files/index.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            ("PUT", "/v1/projects/failing-upload/deployments/dep-fail/files/index.html") => {
+                StubResponse::text(500, "upload-broken")
+            }
+            ("POST", "/v1/projects/failing-upload/deployments/dep-fail/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"failing-upload\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+    assert_eq!(result.code, 1);
+    assert!(
+        result
+            .stderr
+            .contains("publish: 15% (0/0 uploads) preparing\n")
+    );
+    assert!(
+        result
+            .stderr
+            .contains("publish: 15% (0/1 uploads) uploading\n")
+    );
+    assert!(
+        result
+            .stderr
+            .contains("upload failed for index.html: upload-broken")
+    );
+    assert!(result.stderr.ends_with('\n'));
+
+    let requests = server.recorded();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url
+                != "/v1/projects/failing-upload/deployments/dep-fail/activate")
+    );
 }
 
 #[test]
@@ -1467,6 +1669,7 @@ fn publish_basic_sends_basic_auth_and_prints_served_url() {
         result.stdout,
         "published private-site -> https://private-site.example.test\n"
     );
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
 
     let requests = server.recorded();
     assert_eq!(
@@ -1541,7 +1744,7 @@ fn publish_basic_uses_cwd_dotenv_credentials() {
         result.stdout,
         "published private-site -> https://private-site.example.test\n"
     );
-    assert_eq!(result.stderr, "");
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
 
     let requests = server.recorded();
     assert_eq!(
@@ -1620,6 +1823,7 @@ fn publish_basic_prefers_process_env_over_conflicting_dotenv_values() {
         Some(project.path()),
     );
     assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
 
     let requests = server.recorded();
     let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
@@ -1703,6 +1907,7 @@ fn publish_basic_succeeds_with_env_only_credentials_when_cwd_dotenv_is_unreadabl
         Some(project.path()),
     );
     assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
 
     let requests = server.recorded();
     let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
@@ -1775,6 +1980,7 @@ fn publish_basic_allows_mixed_process_env_and_dotenv_sources() {
         Some(project.path()),
     );
     assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
 
     let requests = server.recorded();
     let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
@@ -1967,6 +2173,7 @@ fn publish_accepts_legacy_visibility_public_site_config() {
         result.stdout,
         "published site-default -> https://site-default.example.test\n"
     );
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
     let requests = server.recorded();
     assert!(requests[0].body.contains(r#""access":"public""#));
 }
