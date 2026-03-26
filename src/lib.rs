@@ -23,7 +23,9 @@ const USERNAME_PROMPT_GUIDANCE: &str = "Use your issued username from the admin.
 const DEV_CLI_VERSION: &str = "0.0.0-dev";
 const KEYCHAIN_SERVICE: &str = "cfsurge";
 const KEYCHAIN_ACCOUNT: &str = "api-token";
-const DEFAULT_VISIBILITY: Visibility = Visibility::Public;
+const DEFAULT_ACCESS: Access = Access::Public;
+const BASIC_AUTH_USERNAME_ENV: &str = "CFSURGE_BASIC_AUTH_USERNAME";
+const BASIC_AUTH_PASSWORD_ENV: &str = "CFSURGE_BASIC_AUTH_PASSWORD";
 const MAX_SLUG_LENGTH: usize = 63;
 const FALLBACK_API_RESERVED_LABEL: &str = "api";
 const ALWAYS_RESERVED_LABEL: &str = "www";
@@ -79,23 +81,29 @@ struct StoredAuth {
 struct SiteConfig {
     slug: String,
     publish_dir: String,
-    visibility: Visibility,
+    access: Access,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum Visibility {
+enum Access {
     Public,
-    Unlisted,
+    Basic,
 }
 
-impl Visibility {
+impl Access {
     fn as_str(self) -> &'static str {
         match self {
             Self::Public => "public",
-            Self::Unlisted => "unlisted",
+            Self::Basic => "basic",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyVisibility {
+    Public,
+    Unlisted,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -103,7 +111,6 @@ impl Visibility {
 struct ApiMetadata {
     api_base: Option<String>,
     public_suffix: Option<String>,
-    unlisted_host: Option<String>,
     token_creation_url: Option<String>,
 }
 
@@ -192,12 +199,19 @@ struct ProjectsPayload {
 struct ProjectRecord {
     slug: String,
     hostname: Option<String>,
-    visibility: Option<String>,
+    access: Option<String>,
     served_url: Option<String>,
     public_url: Option<String>,
     active_deployment_id: Option<String>,
     updated_at: Option<String>,
     updated_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BasicAuthPayload {
+    username: String,
+    password: String,
 }
 
 pub fn run() -> Result<(), String> {
@@ -338,6 +352,7 @@ fn login(args: &[String]) -> Result<(), String> {
 }
 
 fn init(args: &[String]) -> Result<(), String> {
+    assert_no_deprecated_visibility_flag(args)?;
     let stored_config = read_stored_config_if_exists()?;
     let api_base = resolve_api_base(
         args,
@@ -361,49 +376,43 @@ fn init(args: &[String]) -> Result<(), String> {
             .map(|item| item.publish_dir.as_str())
             .unwrap_or("."),
     )?;
-    let visibility = resolve_visibility(
+    let access = resolve_access(
         args,
         existing
             .as_ref()
-            .map(|item| item.visibility)
-            .unwrap_or(DEFAULT_VISIBILITY),
+            .map(|item| item.access)
+            .unwrap_or(DEFAULT_ACCESS),
     )?;
 
     write_site_config(&SiteConfig {
         slug: slug.clone(),
         publish_dir: publish_dir.clone(),
-        visibility,
+        access,
     })?;
 
     println!("saved {SITE_CONFIG_FILE_NAME}");
     println!("next step: run \"cfsurge publish\" to deploy this site");
-    if visibility == Visibility::Public {
-        if let Some(public_suffix) = metadata
-            .as_ref()
-            .and_then(|item| read_string_opt(item.public_suffix.as_ref()))
-        {
-            println!("public URL (after publish): https://{slug}.{public_suffix}");
-        }
-    } else if let Some(unlisted_host) = metadata
+    if let Some(public_suffix) = metadata
         .as_ref()
-        .and_then(|item| read_string_opt(item.unlisted_host.as_ref()))
+        .and_then(|item| read_string_opt(item.public_suffix.as_ref()))
     {
-        println!("unlisted URL pattern (after publish): https://{unlisted_host}/<share-token>/");
+        println!("public URL (after publish): https://{slug}.{public_suffix}");
     }
 
     Ok(())
 }
 
 fn publish(args: &[String]) -> Result<(), String> {
+    assert_no_deprecated_visibility_flag(args)?;
     let site_config = read_site_config_if_exists()?;
     let slug =
         read_flag(args, "--slug").or_else(|| site_config.as_ref().map(|item| item.slug.clone()));
     let directory = read_positional_arg(args)
         .or_else(|| site_config.as_ref().map(|item| item.publish_dir.clone()));
-    let visibility = site_config
+    let access = site_config
         .as_ref()
-        .map(|item| item.visibility)
-        .unwrap_or(DEFAULT_VISIBILITY);
+        .map(|item| item.access)
+        .unwrap_or(DEFAULT_ACCESS);
 
     let slug = slug.ok_or_else(|| {
         format!(
@@ -417,22 +426,31 @@ fn publish(args: &[String]) -> Result<(), String> {
     })?;
 
     let config = read_config(ReadConfigOptions::default())?;
-    let metadata = if visibility == Visibility::Unlisted {
-        fetch_api_metadata(&config.api_base)
+    let reserved_labels = build_reserved_labels(Some(config.api_base.as_str()), None);
+    assert_valid_slug(&slug, &reserved_labels)?;
+    let basic_auth = if access == Access::Basic {
+        Some(resolve_basic_auth_from_env()?)
     } else {
         None
     };
-    let reserved_labels = build_reserved_labels(Some(config.api_base.as_str()), metadata.as_ref());
-    assert_valid_slug(&slug, &reserved_labels)?;
-    if visibility == Visibility::Unlisted {
-        assert_unlisted_publish_supported(metadata.as_ref())?;
-    }
 
     let absolute_dir = fs::canonicalize(&directory).map_err(|error| error.to_string())?;
     let files = collect_files(&absolute_dir)?;
     if files.is_empty() {
         return Err("publish target has no files".into());
     }
+    let prepare_body = if let Some(basic_auth) = basic_auth {
+        serde_json::json!({
+            "files": files,
+            "access": access.as_str(),
+            "basicAuth": basic_auth,
+        })
+    } else {
+        serde_json::json!({
+            "files": files,
+            "access": access.as_str(),
+        })
+    };
 
     let client = Client::new();
     let prepare_response = client
@@ -442,10 +460,7 @@ fn publish(args: &[String]) -> Result<(), String> {
             encode(&slug)
         ))
         .headers(auth_headers(&config.token)?)
-        .json(&serde_json::json!({
-            "files": files,
-            "visibility": visibility.as_str(),
-        }))
+        .json(&prepare_body)
         .send()
         .map_err(format_http_error)?;
 
@@ -531,8 +546,7 @@ fn list_projects() -> Result<(), String> {
     }
 
     for project in payload.projects {
-        let visibility =
-            normalize_visibility(project.visibility.as_deref()).unwrap_or(DEFAULT_VISIBILITY);
+        let access = normalize_access(project.access.as_deref()).unwrap_or(DEFAULT_ACCESS);
         let served_url = read_string_opt(project.served_url.as_ref())
             .or_else(|| read_string_opt(project.public_url.as_ref()))
             .or_else(|| read_string_opt(project.hostname.as_ref()))
@@ -540,7 +554,7 @@ fn list_projects() -> Result<(), String> {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}",
             project.slug,
-            visibility.as_str(),
+            access.as_str(),
             served_url,
             project.active_deployment_id.unwrap_or_else(|| "-".into()),
             project.updated_at.unwrap_or_else(|| "-".into()),
@@ -1040,16 +1054,30 @@ fn read_site_config_if_exists() -> Result<Option<SiteConfig>, String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .ok_or_else(|| format!("invalid site config file: {}", path.display()))?;
-    let raw_visibility = value.get("visibility").and_then(|item| item.as_str());
-    let visibility = match raw_visibility {
-        Some(item) => normalize_visibility(Some(item))
+    let raw_access = value.get("access").and_then(|item| item.as_str());
+    let access = match raw_access {
+        Some(item) => normalize_access(Some(item))
             .ok_or_else(|| format!("invalid site config file: {}", path.display()))?,
-        None => DEFAULT_VISIBILITY,
+        None => {
+            let raw_visibility = value.get("visibility").and_then(|item| item.as_str());
+            let legacy_visibility = match raw_visibility {
+                Some(item) => normalize_legacy_visibility(Some(item))
+                    .ok_or_else(|| format!("invalid site config file: {}", path.display()))?,
+                None => LegacyVisibility::Public,
+            };
+            if legacy_visibility == LegacyVisibility::Unlisted {
+                return Err(format!(
+                    "site config migration required: visibility \"unlisted\" is no longer supported. Set \"access\": \"basic\" and provide {}/{} when running publish.",
+                    BASIC_AUTH_USERNAME_ENV, BASIC_AUTH_PASSWORD_ENV
+                ));
+            }
+            DEFAULT_ACCESS
+        }
     };
     Ok(Some(SiteConfig {
         slug: slug.to_string(),
         publish_dir: publish_dir.to_string(),
-        visibility,
+        access,
     }))
 }
 
@@ -1543,32 +1571,30 @@ fn resolve_publish_dir(args: &[String], default_publish_dir: &str) -> Result<Str
     )
 }
 
-fn resolve_visibility(
-    args: &[String],
-    default_visibility: Visibility,
-) -> Result<Visibility, String> {
-    if let Some(value) = read_flag(args, "--visibility") {
-        return parse_visibility_input(&value);
+fn resolve_access(args: &[String], default_access: Access) -> Result<Access, String> {
+    assert_no_deprecated_visibility_flag(args)?;
+    if let Some(value) = read_flag(args, "--access") {
+        return parse_access_input(&value);
     }
     if !is_interactive_prompt_session() {
-        return Ok(default_visibility);
+        return Ok(default_access);
     }
 
     prompt_select(
-        "Visibility",
+        "Access",
         &[
             SelectOption {
-                value: Visibility::Public,
+                value: Access::Public,
                 label: "public",
                 description: "Published at https://<slug>.<publicSuffix>",
             },
             SelectOption {
-                value: Visibility::Unlisted,
-                label: "unlisted",
-                description: "Published at unlisted host with a share token",
+                value: Access::Basic,
+                label: "basic",
+                description: "Published at the same URL with HTTP Basic authentication",
             },
         ],
-        default_visibility,
+        default_access,
     )
 }
 
@@ -1620,18 +1646,76 @@ fn print_token_creation_hint_if_needed(
     writeln!(stdout, "{url}").map_err(|error| error.to_string())
 }
 
-fn normalize_visibility(value: Option<&str>) -> Option<Visibility> {
+fn normalize_access(value: Option<&str>) -> Option<Access> {
     let normalized = value?.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "public" => Some(Visibility::Public),
-        "unlisted" => Some(Visibility::Unlisted),
+        "public" => Some(Access::Public),
+        "basic" => Some(Access::Basic),
         _ => None,
     }
 }
 
-fn parse_visibility_input(value: &str) -> Result<Visibility, String> {
-    normalize_visibility(Some(value))
-        .ok_or_else(|| "invalid visibility: expected public or unlisted".into())
+fn normalize_legacy_visibility(value: Option<&str>) -> Option<LegacyVisibility> {
+    let normalized = value?.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "public" => Some(LegacyVisibility::Public),
+        "unlisted" => Some(LegacyVisibility::Unlisted),
+        _ => None,
+    }
+}
+
+fn parse_access_input(value: &str) -> Result<Access, String> {
+    normalize_access(Some(value)).ok_or_else(|| "invalid access: expected public or basic".into())
+}
+
+fn assert_no_deprecated_visibility_flag(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|value| value == "--visibility") {
+        Err("--visibility is no longer supported. Use --access <public|basic>.".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn resolve_basic_auth_from_env() -> Result<BasicAuthPayload, String> {
+    let username = env::var(BASIC_AUTH_USERNAME_ENV)
+        .ok()
+        .and_then(|value| read_string(&value))
+        .ok_or_else(|| {
+            format!(
+                "basic publish requires {} and {}",
+                BASIC_AUTH_USERNAME_ENV, BASIC_AUTH_PASSWORD_ENV
+            )
+        })?;
+    let password = env::var(BASIC_AUTH_PASSWORD_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "basic publish requires {} and {}",
+                BASIC_AUTH_USERNAME_ENV, BASIC_AUTH_PASSWORD_ENV
+            )
+        })?;
+    if !is_valid_basic_username(&username) {
+        return Err(
+            "invalid basic auth username: expected non-empty printable ASCII without ':'".into(),
+        );
+    }
+    if !is_valid_basic_password(&password) {
+        return Err("invalid basic auth password: expected non-empty printable ASCII".into());
+    }
+    Ok(BasicAuthPayload { username, password })
+}
+
+fn is_valid_basic_username(value: &str) -> bool {
+    !value.is_empty() && !value.contains(':') && is_printable_ascii(value)
+}
+
+fn is_valid_basic_password(value: &str) -> bool {
+    !value.is_empty() && is_printable_ascii(value)
+}
+
+fn is_printable_ascii(value: &str) -> bool {
+    value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
 }
 
 fn parse_slug_input(value: &str, reserved_labels: &[String]) -> Result<String, String> {
@@ -1791,11 +1875,6 @@ fn build_reserved_labels(api_base: Option<&str>, metadata: Option<&ApiMetadata>)
     if !reserved.contains(&api_label) {
         reserved.push(api_label);
     }
-    if let Some(label) = resolve_unlisted_host_first_label(metadata)
-        && !reserved.contains(&label)
-    {
-        reserved.push(label);
-    }
     reserved
 }
 
@@ -1819,35 +1898,6 @@ fn extract_first_hostname_label(value: &str) -> Option<String> {
         .next()
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
-}
-
-fn resolve_unlisted_host_first_label(metadata: Option<&ApiMetadata>) -> Option<String> {
-    let value = metadata.and_then(|item| read_string_opt(item.unlisted_host.as_ref()))?;
-    let url_value = if value.contains("://") {
-        value
-    } else {
-        format!("https://{value}")
-    };
-    let hostname = reqwest::Url::parse(&url_value)
-        .ok()?
-        .host_str()?
-        .to_ascii_lowercase();
-    hostname
-        .split('.')
-        .next()
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty())
-}
-
-fn assert_unlisted_publish_supported(metadata: Option<&ApiMetadata>) -> Result<(), String> {
-    if metadata
-        .and_then(|item| read_string_opt(item.unlisted_host.as_ref()))
-        .is_some()
-    {
-        Ok(())
-    } else {
-        Err("unlisted publish is not supported by this server: /v1/meta did not include unlistedHost".into())
-    }
 }
 
 fn prompt(label: &str) -> Result<String, String> {
@@ -2061,7 +2111,7 @@ fn read_stdin_line() -> Result<String, String> {
 
 fn print_help() {
     print!(
-        "cfsurge commands:\n  login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--new-password <password>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  passwd [--current-password <password>] [--new-password <password>]\n  admin users list\n  admin users create --username <username> [--role <user|admin>] [--temporary-password <password>]\n  admin users reset-password <username>\n  admin users disable <username>\n  admin users enable <username>\n  logout\n  interactive choices: use ↑/↓ and Enter\n"
+        "cfsurge commands:\n  login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--new-password <password>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--access <public|basic>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  passwd [--current-password <password>] [--new-password <password>]\n  admin users list\n  admin users create --username <username> [--role <user|admin>] [--temporary-password <password>]\n  admin users reset-password <username>\n  admin users disable <username>\n  admin users enable <username>\n  logout\n  interactive choices: use ↑/↓ and Enter\n"
     );
 }
 
@@ -2196,7 +2246,6 @@ mod tests {
         let metadata = ApiMetadata {
             api_base: Some("https://manage.example.test".to_string()),
             public_suffix: Some("example.test".to_string()),
-            unlisted_host: Some("u.example.test".to_string()),
             token_creation_url: None,
         };
         let labels = build_reserved_labels(Some("https://api.example.test"), Some(&metadata));

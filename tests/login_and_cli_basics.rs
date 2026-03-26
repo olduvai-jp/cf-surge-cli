@@ -113,6 +113,8 @@ fn run_cli(args: &[&str], env: &[(&str, &str)], stdin_text: Option<&str>) -> std
     command.env_remove("CFSURGE_TOKEN");
     command.env_remove("CFSURGE_USERNAME");
     command.env_remove("CFSURGE_PASSWORD");
+    command.env_remove("CFSURGE_BASIC_AUTH_USERNAME");
+    command.env_remove("CFSURGE_BASIC_AUTH_PASSWORD");
     command.env_remove("CFSURGE_CLI_VERSION");
     for (key, value) in env {
         command.env(key, value);
@@ -201,6 +203,7 @@ fn help_output_includes_version_flag() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--version"));
+    assert!(stdout.contains("--access <public|basic>"));
     assert!(stdout.contains("interactive choices: use"));
 }
 

@@ -64,12 +64,13 @@ Expand-Archive .\cfsurge-windows-x64.zip -DestinationPath .
 - If `--auth service-session` is explicitly combined with token input, login fails with `token-based login requires --auth cloudflare-admin`.
 - If a service-session account requires password change, `login` can complete it inline. Non-interactive runs must pass `--new-password`.
 - `--new-password` is rejected for `cloudflare-admin` login.
-- `init` writes `.cfsurge.json` in the current directory and stores `slug`, `publishDir`, and `visibility`.
-- `init --visibility unlisted` can be used when the service supports obfuscated publish URLs.
+- `init` writes `.cfsurge.json` in the current directory and stores `slug`, `publishDir`, and `access`.
+- `init --access basic` can be used for Basic-auth protected publishing on the same slug subdomain.
 - `publish` uses the positional directory argument first, then the `publishDir` field in `.cfsurge.json`.
 - `publish` uses `--slug` first, then the `slug` field in `.cfsurge.json`.
-- `publish` uses the `visibility` field in `.cfsurge.json` to choose `public` or `unlisted`.
+- `publish` uses the `access` field in `.cfsurge.json` to choose `public` or `basic`.
+- `publish` with `access=basic` requires `CFSURGE_BASIC_AUTH_USERNAME` and `CFSURGE_BASIC_AUTH_PASSWORD`.
 - `remove` uses the positional slug first, then the `slug` field in `.cfsurge.json`.
-- `list` prints TSV columns: `slug`, `visibility`, `servedUrl`, `activeDeploymentId`, `updatedAt`, `updatedBy`.
+- `list` prints TSV columns: `slug`, `access`, `servedUrl`, `activeDeploymentId`, `updatedAt`, `updatedBy`.
 - `passwd` is available only for `service-session` logins and auto re-logs in on success.
 - `admin users` supports `list`, `create`, `reset-password`, `disable`, and `enable`.

@@ -15,7 +15,8 @@ Keep the flow focused on:
 - extracting it (zip names differ by platform)
 - running the unified executable name (`cfsurge` on macOS/Linux, `cfsurge.exe` on Windows)
 - running `login`, `init`, `publish`, `list`, `remove`, or `--version`
-- handling `public` / `unlisted` publish via the `visibility` field in `.cfsurge.json`
+- handling `public` / `basic` publish via the `access` field in `.cfsurge.json`
+- reminding that `access=basic` requires `CFSURGE_BASIC_AUTH_USERNAME` and `CFSURGE_BASIC_AUTH_PASSWORD` on every publish
 
 Do not switch to repo-clone, npm, or local build instructions unless the user explicitly asks for development workflow.
 
@@ -30,6 +31,8 @@ Do not switch to repo-clone, npm, or local build instructions unless the user ex
 - Ask for or infer the OS: macOS Apple Silicon, Linux x64, or Windows x64.
 - Ask for `apiBase` if the user has not provided it. The distributed CLI does not assume a default.
 - Ask whether they already have a Cloudflare API token if `login` is part of the task.
+- Ask for `slug` if the task needs `init`, `publish`, or `remove` and the user has not provided one.
+- Ask for access mode (`public` or `basic`) if the task needs `init` or `publish` and the user has not provided one.
 
 3. Use the CLI's real first-run behavior.
 - `login` prompts for `API base URL:` when `--api-base`, `CFSURGE_API_BASE`, and stored config are all absent.
@@ -41,7 +44,8 @@ Do not switch to repo-clone, npm, or local build instructions unless the user ex
 
 5. Keep config guidance minimal.
 - `init` writes `.cfsurge.json` in the current project directory.
-- `init` stores `slug`, `publishDir`, and `visibility`.
+- `init` stores `slug`, `publishDir`, and `access`.
+- Basic credentials are not stored in `.cfsurge.json`; they are passed via environment variables during `publish`.
 - `publish` and `remove` can use values from `.cfsurge.json` when explicit args are omitted.
 
 ## When To Use References
@@ -54,5 +58,7 @@ Load `references/commands.md` when you need:
 ## Constraints
 
 - Treat `apiBase` as required input unless the user already has it configured.
+- Treat `slug` as user-owned input for `init`, `publish`, and `remove`.
+- Treat access mode (`public` or `basic`) as user-owned input for `init` and `publish`.
 - Keep examples generic to `cfsurge`; `oldv.page` can be mentioned only as an example service.
 - Do not describe repo-internal release workflows, generated files, or operator config unless the user explicitly pivots to maintainer work.

@@ -73,6 +73,8 @@ fn run_cli(
     command.env_remove("CFSURGE_TOKEN");
     command.env_remove("CFSURGE_USERNAME");
     command.env_remove("CFSURGE_PASSWORD");
+    command.env_remove("CFSURGE_BASIC_AUTH_USERNAME");
+    command.env_remove("CFSURGE_BASIC_AUTH_PASSWORD");
     command.env_remove("CFSURGE_CLI_VERSION");
     for (key, value) in envs {
         command.env(key, value);
@@ -1012,7 +1014,7 @@ fn login_stores_token_in_keychain_when_explicitly_requested_and_list_reads_it() 
             )),
             ("POST", "/v1/auth/verify") => StubResponse::json(r#"{"actor":"cf-token:keychain"}"#),
             ("GET", "/v1/projects") => StubResponse::json(
-                r#"{"projects":[{"slug":"site-a","visibility":"public","servedUrl":"https://site-a.example.test","activeDeploymentId":"dep-1","updatedAt":"2026-03-24T00:00:00.000Z","updatedBy":"cf-token:keychain"}]}"#,
+                r#"{"projects":[{"slug":"site-a","access":"public","servedUrl":"https://site-a.example.test","activeDeploymentId":"dep-1","updatedAt":"2026-03-24T00:00:00.000Z","updatedBy":"cf-token:keychain"}]}"#,
             ),
             _ => StubResponse::text(404, "not found"),
         }
@@ -1143,7 +1145,11 @@ fn init_prompts_for_api_base_and_writes_site_config() {
     assert_eq!(result.stderr, "");
     assert!(result.stdout.contains("API base URL: "));
     assert!(result.stdout.contains("saved .cfsurge.json"));
-    assert!(result.stdout.contains("next step: run \"cfsurge publish\" to deploy this site"));
+    assert!(
+        result
+            .stdout
+            .contains("next step: run \"cfsurge publish\" to deploy this site")
+    );
     assert!(
         result
             .stdout
@@ -1153,17 +1159,17 @@ fn init_prompts_for_api_base_and_writes_site_config() {
     let site_config = fs::read_to_string(site_config_path_for_dir(project.path())).unwrap();
     assert!(site_config.contains(r#""slug": "my-site""#));
     assert!(site_config.contains(r#""publishDir": ".""#));
-    assert!(site_config.contains(r#""visibility": "public""#));
+    assert!(site_config.contains(r#""access": "public""#));
 }
 
 #[test]
-fn init_stores_unlisted_visibility_and_prints_preview() {
+fn init_stores_basic_access() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let server = start_stub_server(move |api_base, request| {
         match (request.method.as_str(), request.url.as_str()) {
             ("GET", "/v1/meta") => StubResponse::json(&format!(
-                r#"{{"apiBase":"{}","publicSuffix":"example.test","unlistedHost":"u.example.test","tokenCreationUrl":null}}"#,
+                r#"{{"apiBase":"{}","publicSuffix":"example.test","tokenCreationUrl":null}}"#,
                 api_base
             )),
             _ => StubResponse::text(404, "not found"),
@@ -1179,8 +1185,8 @@ fn init_stores_unlisted_visibility_and_prints_preview() {
             "private-site",
             "--publish-dir",
             "public",
-            "--visibility",
-            "unlisted",
+            "--access",
+            "basic",
         ],
         &home_envs(&home),
         "",
@@ -1189,14 +1195,13 @@ fn init_stores_unlisted_visibility_and_prints_preview() {
 
     assert_eq!(result.code, 0, "{}", result.stderr);
     assert_eq!(result.stderr, "");
-    assert!(result.stdout.contains("next step: run \"cfsurge publish\" to deploy this site"));
     assert!(
         result
             .stdout
-            .contains("unlisted URL pattern (after publish): https://u.example.test/<share-token>/")
+            .contains("next step: run \"cfsurge publish\" to deploy this site")
     );
     let site_config = fs::read_to_string(site_config_path_for_dir(project.path())).unwrap();
-    assert!(site_config.contains(r#""visibility": "unlisted""#));
+    assert!(site_config.contains(r#""access": "basic""#));
 }
 
 #[test]
@@ -1228,13 +1233,17 @@ fn init_still_saves_site_config_when_metadata_is_unavailable() {
     assert_eq!(result.code, 0, "{}", result.stderr);
     assert_eq!(result.stderr, "");
     assert!(result.stdout.contains("saved .cfsurge.json"));
-    assert!(result.stdout.contains("next step: run \"cfsurge publish\" to deploy this site"));
+    assert!(
+        result
+            .stdout
+            .contains("next step: run \"cfsurge publish\" to deploy this site")
+    );
     assert!(!result.stdout.contains("public URL preview"));
 
     let site_config = fs::read_to_string(site_config_path_for_dir(project.path())).unwrap();
     assert!(site_config.contains(r#""slug": "my-site""#));
     assert!(site_config.contains(r#""publishDir": "public""#));
-    assert!(site_config.contains(r#""visibility": "public""#));
+    assert!(site_config.contains(r#""access": "public""#));
 }
 
 #[test]
@@ -1288,7 +1297,7 @@ fn publish_uses_site_config_defaults() {
     create_site_directory(project.path(), "public");
     fs::write(
         site_config_path_for_dir(project.path()),
-        "{\n  \"slug\": \"site-default\",\n  \"publishDir\": \"public\",\n  \"visibility\": \"public\"\n}\n",
+        "{\n  \"slug\": \"site-default\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
     )
     .unwrap();
 
@@ -1304,7 +1313,12 @@ fn publish_uses_site_config_defaults() {
         requests[0].url,
         "/v1/projects/site-default/deployments/prepare"
     );
-    assert!(requests[0].body.contains(r#""visibility":"public""#));
+    let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        prepare_body.get("access").and_then(Value::as_str),
+        Some("public")
+    );
+    assert!(prepare_body.get("basicAuth").is_none());
     assert_eq!(
         requests[1].content_type.as_deref(),
         Some("text/html; charset=utf-8")
@@ -1344,7 +1358,7 @@ fn publish_explicit_args_override_site_config() {
     let explicit_dir = create_site_directory(project.path(), "explicit-dir");
     fs::write(
         site_config_path_for_dir(project.path()),
-        "{\n  \"slug\": \"config-slug\",\n  \"publishDir\": \"config-dir\",\n  \"visibility\": \"public\"\n}\n",
+        "{\n  \"slug\": \"config-slug\",\n  \"publishDir\": \"config-dir\",\n  \"access\": \"public\"\n}\n",
     )
     .unwrap();
 
@@ -1370,22 +1384,247 @@ fn publish_explicit_args_override_site_config() {
         requests[0].url,
         "/v1/projects/slug-override/deployments/prepare"
     );
-    assert!(requests[0].body.contains(r#""visibility":"public""#));
+    assert!(requests[0].body.contains(r#""access":"public""#));
 }
 
 #[test]
-fn publish_unlisted_fails_when_meta_lacks_unlisted_host() {
+fn publish_basic_requires_basic_auth_env_vars() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(|_, _| StubResponse::text(404, "not found"));
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"basic\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+    assert_eq!(result.code, 1);
+    assert!(result.stderr.contains(
+        "basic publish requires CFSURGE_BASIC_AUTH_USERNAME and CFSURGE_BASIC_AUTH_PASSWORD"
+    ));
+}
+
+#[test]
+fn publish_basic_sends_basic_auth_and_prints_served_url() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let server = start_stub_server(move |api_base, request| {
         match (request.method.as_str(), request.url.as_str()) {
-            ("GET", "/v1/meta") => StubResponse::json(&format!(
-                r#"{{"apiBase":"{}","publicSuffix":"example.test","tokenCreationUrl":null}}"#,
-                api_base
-            )),
+            ("POST", "/v1/projects/private-site/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-basic","servedUrl":"https://private-site.example.test","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/private-site/deployments/dep-basic/files/index.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            ("PUT", "/v1/projects/private-site/deployments/dep-basic/files/index.html") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("POST", "/v1/projects/private-site/deployments/dep-basic/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
             _ => StubResponse::text(404, "not found"),
         }
     });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"basic\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &["publish"],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", "/nonexistent"),
+            ("CFSURGE_BASIC_AUTH_USERNAME", "alice"),
+            ("CFSURGE_BASIC_AUTH_PASSWORD", "secret-basic-password"),
+        ],
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "published private-site -> https://private-site.example.test\n"
+    );
+
+    let requests = server.recorded();
+    assert_eq!(
+        requests[0].url,
+        "/v1/projects/private-site/deployments/prepare"
+    );
+    let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        prepare_body.get("access").and_then(Value::as_str),
+        Some("basic")
+    );
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("username"))
+            .and_then(Value::as_str),
+        Some("alice")
+    );
+    assert_eq!(
+        prepare_body
+            .get("basicAuth")
+            .and_then(|value| value.get("password"))
+            .and_then(Value::as_str),
+        Some("secret-basic-password")
+    );
+}
+
+#[test]
+fn publish_rejects_invalid_basic_auth_username() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(|_, _| StubResponse::text(404, "not found"));
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"basic\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &["publish"],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", "/nonexistent"),
+            ("CFSURGE_BASIC_AUTH_USERNAME", "alice:invalid"),
+            ("CFSURGE_BASIC_AUTH_PASSWORD", "secret-basic-password"),
+        ],
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 1);
+    assert!(
+        result.stderr.contains(
+            "invalid basic auth username: expected non-empty printable ASCII without ':'"
+        )
+    );
+}
+
+#[test]
+fn publish_rejects_invalid_basic_auth_password() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(|_, _| StubResponse::text(404, "not found"));
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"basic\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &["publish"],
+        &[
+            ("HOME", home.path().to_str().unwrap()),
+            ("USERPROFILE", home.path().to_str().unwrap()),
+            ("PATH", "/nonexistent"),
+            ("CFSURGE_BASIC_AUTH_USERNAME", "alice"),
+            ("CFSURGE_BASIC_AUTH_PASSWORD", "pässword"),
+        ],
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 1);
+    assert!(
+        result
+            .stderr
+            .contains("invalid basic auth password: expected non-empty printable ASCII")
+    );
+}
+
+#[test]
+fn publish_accepts_legacy_visibility_public_site_config() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/site-default/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-legacy-public","publicUrl":"https://site-default.example.test","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/site-default/deployments/dep-legacy-public/files/index.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            ("PUT", "/v1/projects/site-default/deployments/dep-legacy-public/files/index.html") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("POST", "/v1/projects/site-default/deployments/dep-legacy-public/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"site-default\",\n  \"publishDir\": \"public\",\n  \"visibility\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(
+        result.stdout,
+        "published site-default -> https://site-default.example.test\n"
+    );
+    let requests = server.recorded();
+    assert!(requests[0].body.contains(r#""access":"public""#));
+}
+
+#[test]
+fn publish_rejects_legacy_visibility_unlisted_site_config() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(|_, _| StubResponse::text(404, "not found"));
 
     write_config(
         home.path(),
@@ -1404,66 +1643,54 @@ fn publish_unlisted_fails_when_meta_lacks_unlisted_host() {
     let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
     assert_eq!(result.code, 1);
     assert!(
-        result
-            .stderr
-            .contains("unlisted publish is not supported by this server")
+        result.stderr.contains(
+            "site config migration required: visibility \"unlisted\" is no longer supported. Set \"access\": \"basic\" and provide CFSURGE_BASIC_AUTH_USERNAME/CFSURGE_BASIC_AUTH_PASSWORD when running publish."
+        )
     );
 }
 
 #[test]
-fn publish_unlisted_sends_visibility_and_prints_served_url() {
+fn init_rejects_deprecated_visibility_flag() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
-    let server = start_stub_server(move |api_base, request| {
-        match (request.method.as_str(), request.url.as_str()) {
-            ("GET", "/v1/meta") => StubResponse::json(&format!(
-                r#"{{"apiBase":"{}","publicSuffix":"example.test","unlistedHost":"u.example.test","tokenCreationUrl":null}}"#,
-                api_base
-            )),
-            ("POST", "/v1/projects/private-site/deployments/prepare") => {
-                StubResponse::json(&format!(
-                    r#"{{"deploymentId":"dep-unlisted","servedUrl":"https://u.example.test/abc123","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/private-site/deployments/dep-unlisted/files/index.html"}}]}}"#,
-                    api_base
-                ))
-            }
-            ("PUT", "/v1/projects/private-site/deployments/dep-unlisted/files/index.html") => {
-                StubResponse::json(r#"{"ok":true}"#)
-            }
-            ("POST", "/v1/projects/private-site/deployments/dep-unlisted/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
-            }
-            _ => StubResponse::text(404, "not found"),
-        }
-    });
-
-    write_config(
-        home.path(),
-        &format!(
-            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
-            server.api_base
-        ),
+    let result = run_cli(
+        &[
+            "init",
+            "--api-base",
+            "https://api.example.test",
+            "--slug",
+            "my-site",
+            "--publish-dir",
+            ".",
+            "--visibility",
+            "public",
+        ],
+        &home_envs(&home),
+        "",
+        Some(project.path()),
     );
-    create_site_directory(project.path(), "public");
-    fs::write(
-        site_config_path_for_dir(project.path()),
-        "{\n  \"slug\": \"private-site\",\n  \"publishDir\": \"public\",\n  \"visibility\": \"unlisted\"\n}\n",
-    )
-    .unwrap();
-
-    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
-    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(result.code, 1);
     assert_eq!(
-        result.stdout,
-        "published private-site -> https://u.example.test/abc123\n"
+        result.stderr.trim(),
+        "--visibility is no longer supported. Use --access <public|basic>."
     );
+}
 
-    let requests = server.recorded();
-    assert_eq!(requests[0].url, "/v1/meta");
-    assert_eq!(
-        requests[1].url,
-        "/v1/projects/private-site/deployments/prepare"
+#[test]
+fn publish_rejects_deprecated_visibility_flag() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let result = run_cli(
+        &["publish", "--visibility", "public"],
+        &home_envs(&home),
+        "",
+        Some(project.path()),
     );
-    assert!(requests[1].body.contains(r#""visibility":"unlisted""#));
+    assert_eq!(result.code, 1);
+    assert_eq!(
+        result.stderr.trim(),
+        "--visibility is no longer supported. Use --access <public|basic>."
+    );
 }
 
 #[test]
@@ -1576,12 +1803,12 @@ fn remove_reserves_unlisted_host_label() {
 }
 
 #[test]
-fn list_prints_visibility_and_fallbacks() {
+fn list_prints_access_and_fallbacks() {
     let home = TempDir::new().unwrap();
     let server = start_stub_server(|_, request| {
         match (request.method.as_str(), request.url.as_str()) {
             ("GET", "/v1/projects") => StubResponse::json(
-                r#"{"projects":[{"slug":"public-site","visibility":"public","servedUrl":"https://public-site.example.test","publicUrl":"https://public-site.example.test","hostname":"https://public-site.example.test","activeDeploymentId":"dep-1","updatedAt":"2026-03-23T00:00:00.000Z","updatedBy":"cf-token:a"},{"slug":"legacy","publicUrl":"https://legacy.example.test","hostname":"https://legacy.example.test","activeDeploymentId":null,"updatedAt":null,"updatedBy":null}]}"#,
+                r#"{"projects":[{"slug":"public-site","access":"public","servedUrl":"https://public-site.example.test","publicUrl":"https://public-site.example.test","hostname":"https://public-site.example.test","activeDeploymentId":"dep-1","updatedAt":"2026-03-23T00:00:00.000Z","updatedBy":"cf-token:a"},{"slug":"legacy","publicUrl":"https://legacy.example.test","hostname":"https://legacy.example.test","activeDeploymentId":null,"updatedAt":null,"updatedBy":null}]}"#,
             ),
             _ => StubResponse::text(404, "not found"),
         }

@@ -12,7 +12,7 @@
 - 管理者向けユーザー管理 (`admin users ...`)
 - 公開形態の選択:
   - `public`: 通常公開
-  - `unlisted`: 共有 URL を知っている人のみアクセス
+  - `basic`: 同じ公開 URL で HTTP Basic 認証を要求
 
 ## インストール
 
@@ -77,12 +77,12 @@ cfsurge init --slug my-site --publish-dir dist
 ```
 
 成功すると `.cfsurge.json` が作成され、`saved .cfsurge.json` が表示されます。  
-`public` なら `public URL preview: ...`、`unlisted` なら `unlisted URL preview: ...` が表示されます。
+`public URL preview: ...` が表示されます。
 
-`--visibility` は `public` または `unlisted` を指定できます。
+`--access` は `public` または `basic` を指定できます。
 
 ```bash
-cfsurge init --slug my-site --publish-dir dist --visibility unlisted
+cfsurge init --slug my-site --publish-dir dist --access basic
 ```
 
 ### 3) 公開
@@ -101,19 +101,21 @@ cfsurge publish dist --slug my-site
 
 成功時は `published <slug> -> <url>` が表示されます。
 
+`access=basic` の場合は `publish` 実行時に毎回、次の環境変数が必須です。
+
+- `CFSURGE_BASIC_AUTH_USERNAME`
+- `CFSURGE_BASIC_AUTH_PASSWORD`
+
 ## 公開形態
 
 - `public`: 通常の公開 URL でアクセスできます。
-- `unlisted`: 共有 URL 経由でアクセスします。
-
-`unlisted` は、接続先サーバーが対応している場合にのみ利用できます。  
-未対応の場合、`publish` は `unlisted publish is not supported by this server` で失敗します。
+- `basic`: 通常の公開 URL で HTTP Basic 認証を要求します。
 
 ## コマンド一覧
 
 ```text
 login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--new-password <password>] [--token <token>] [--token-storage <file|keychain>]
-init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--visibility <public|unlisted>]
+init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--access <public|basic>]
 publish [dir] [--slug <slug>]
 --version
 list
@@ -133,7 +135,7 @@ logout
 `list` は TSV 形式で 1 行ずつ出力します。
 
 ```text
-<slug>\t<visibility>\t<served/public url>\t<activeDeploymentId>\t<updatedAt>\t<updatedBy>
+<slug>\t<access>\t<served/public url>\t<activeDeploymentId>\t<updatedAt>\t<updatedBy>
 ```
 
 ## 設定ファイル
@@ -162,7 +164,7 @@ logout
 
 - `slug`
 - `publishDir`
-- `visibility`
+- `access`
 
 ## 環境変数
 
@@ -170,6 +172,8 @@ logout
 - `CFSURGE_TOKEN`: API token を上書き
 - `CFSURGE_USERNAME`: `service-session` ログインの username を上書き
 - `CFSURGE_PASSWORD`: `service-session` ログインの password を上書き
+- `CFSURGE_BASIC_AUTH_USERNAME`: `access=basic` publish の Basic 認証 username
+- `CFSURGE_BASIC_AUTH_PASSWORD`: `access=basic` publish の Basic 認証 password
 - `CFSURGE_CLI_VERSION`: `--version` 表示値の注入用 (主にビルド/リリース用途)
 
 ## トラブルシュート
@@ -182,8 +186,16 @@ logout
   `/v1` や `?x=1` を付けず、オリジンだけを指定してください。
 - `publish target has no files`  
   `publishDir` (または `publish` で指定したディレクトリ) に配信ファイルがあるか確認してください。
-- `invalid visibility: expected public or unlisted`  
-  `--visibility` は `public` か `unlisted` のみ指定できます。
+- `invalid access: expected public or basic`  
+  `--access` は `public` か `basic` のみ指定できます。
+- `--visibility is no longer supported. Use --access <public|basic>.`  
+  `--visibility` は廃止されました。`--access` を使ってください。
+- `basic publish requires CFSURGE_BASIC_AUTH_USERNAME and CFSURGE_BASIC_AUTH_PASSWORD`  
+  `access=basic` の publish では 2 つの環境変数が必須です。
+- `invalid basic auth username: expected non-empty printable ASCII without ':'`  
+  username は空文字不可・表示可能 ASCII のみ・`:` を含められません。
+- `invalid basic auth password: expected non-empty printable ASCII`  
+  password は空文字不可・表示可能 ASCII のみ指定できます。
 - `password change required. Run cfsurge passwd.`  
   `service-session` ログイン後に初回変更が必須な状態です。`cfsurge passwd` を実行してください。
 - `password change required for this account. Re-run cfsurge login with --new-password <password>.`  
