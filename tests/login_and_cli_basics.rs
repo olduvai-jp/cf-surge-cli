@@ -203,7 +203,8 @@ fn help_output_includes_version_flag() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--version"));
-    assert!(stdout.contains("--access <public|basic>"));
+    assert!(stdout.contains("--access <public|basic|link>"));
+    assert!(stdout.contains("publish [dir] [--slug <slug>] [--rotate-share-link]"));
     assert!(stdout.contains("interactive choices: use"));
 }
 

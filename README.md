@@ -13,6 +13,7 @@
 - 公開形態の選択:
   - `public`: 通常公開
   - `basic`: 同じ公開 URL で HTTP Basic 認証を要求
+  - `link`: 同じ公開 URL を share URL で限定公開
 
 ## インストール
 
@@ -79,10 +80,14 @@ cfsurge init --slug my-site --publish-dir dist
 成功すると `.cfsurge.json` が作成され、`saved .cfsurge.json` が表示されます。  
 `public URL preview: ...` が表示されます。
 
-`--access` は `public` または `basic` を指定できます。
+`--access` は `public` / `basic` / `link` を指定できます。
 
 ```bash
 cfsurge init --slug my-site --publish-dir dist --access basic
+```
+
+```bash
+cfsurge init --slug my-site --publish-dir dist --access link
 ```
 
 ### 3) 公開
@@ -99,25 +104,36 @@ cfsurge publish
 cfsurge publish dist --slug my-site
 ```
 
+share URL をローテーションしたい場合:
+
+```bash
+cfsurge publish --rotate-share-link
+```
+
 `publish` の進捗は `stderr` に出力されます。TTY ではスピナー付きで 1 行更新、非 TTY では改行付きログとして出力されます。  
 成功時の最終行 `published <slug> -> <url>` は `stdout` に出力されます。
+`prepare` が `shareUrl` を返した場合は、続けて `share url: <url>` 行を `stdout` に出力します。
 
 `access=basic` の場合は `publish` 実行時に毎回、次の環境変数が必須です。
 
 - `CFSURGE_BASIC_AUTH_USERNAME`
 - `CFSURGE_BASIC_AUTH_PASSWORD`
 
+`access=link` では Basic 認証環境変数は不要です。  
+共有リンク機能は API/Worker 側の `SHARE_LINK_SECRET` 設定に依存し、未設定時は share URL が機能しません。
+
 ## 公開形態
 
 - `public`: 通常の公開 URL でアクセスできます。
 - `basic`: 通常の公開 URL で HTTP Basic 認証を要求します。
+- `link`: 通常の公開 URL に対して share URL (`/_cfsurge/share/<token>`) でアクセスセッションを発行します。
 
 ## コマンド一覧
 
 ```text
 login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--new-password <password>] [--token <token>] [--token-storage <file|keychain>]
-init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--access <public|basic>]
-publish [dir] [--slug <slug>]
+init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--access <public|basic|link>]
+publish [dir] [--slug <slug>] [--rotate-share-link]
 --version
 list
 remove [slug]
@@ -136,7 +152,7 @@ logout
 `list` は TSV 形式で 1 行ずつ出力します。
 
 ```text
-<slug>\t<access>\t<served/public url>\t<activeDeploymentId>\t<updatedAt>\t<updatedBy>
+<slug>\t<access>\t<served/public url>\t<activeDeploymentId>\t<updatedAt>\t<updatedBy>\t<shareUrl>
 ```
 
 ## 設定ファイル
@@ -187,12 +203,14 @@ logout
   `/v1` や `?x=1` を付けず、オリジンだけを指定してください。
 - `publish target has no files`  
   `publishDir` (または `publish` で指定したディレクトリ) に配信ファイルがあるか確認してください。
-- `invalid access: expected public or basic`  
-  `--access` は `public` か `basic` のみ指定できます。
-- `--visibility is no longer supported. Use --access <public|basic>.`  
+- `invalid access: expected public, basic, or link`  
+  `--access` は `public` / `basic` / `link` のみ指定できます。
+- `--visibility is no longer supported. Use --access <public|basic|link>.`  
   `--visibility` は廃止されました。`--access` を使ってください。
 - `basic publish requires CFSURGE_BASIC_AUTH_USERNAME and CFSURGE_BASIC_AUTH_PASSWORD`  
   `access=basic` の publish では 2 つの環境変数が必須です。
+- `--rotate-share-link is only available when access=link`  
+  `--rotate-share-link` は `access=link` の publish でのみ利用できます。
 - `invalid basic auth username: expected non-empty printable ASCII without ':'`  
   username は空文字不可・表示可能 ASCII のみ・`:` を含められません。
 - `invalid basic auth password: expected non-empty printable ASCII`  

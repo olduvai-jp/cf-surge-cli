@@ -302,6 +302,12 @@ fn help_output_includes_version() {
     let result = run_cli(&["--help"], &[], "", None);
     assert_eq!(result.code, 0);
     assert_eq!(result.stderr, "");
+    assert!(result.stdout.contains("--access <public|basic|link>"));
+    assert!(
+        result
+            .stdout
+            .contains("publish [dir] [--slug <slug>] [--rotate-share-link]")
+    );
     assert!(result.stdout.contains("--version"));
     assert!(
         result
@@ -1237,6 +1243,43 @@ fn init_stores_basic_access() {
 }
 
 #[test]
+fn init_stores_link_access() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("GET", "/v1/meta") => StubResponse::json(&format!(
+                r#"{{"apiBase":"{}","publicSuffix":"example.test","tokenCreationUrl":null}}"#,
+                api_base
+            )),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    let result = run_cli(
+        &[
+            "init",
+            "--api-base",
+            &server.api_base,
+            "--slug",
+            "share-site",
+            "--publish-dir",
+            "public",
+            "--access",
+            "link",
+        ],
+        &home_envs(&home),
+        "",
+        Some(project.path()),
+    );
+
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_eq!(result.stderr, "");
+    let site_config = fs::read_to_string(site_config_path_for_dir(project.path())).unwrap();
+    assert!(site_config.contains(r#""access": "link""#));
+}
+
+#[test]
 fn init_still_saves_site_config_when_metadata_is_unavailable() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
@@ -1694,6 +1737,184 @@ fn publish_basic_sends_basic_auth_and_prints_served_url() {
             .and_then(|value| value.get("password"))
             .and_then(Value::as_str),
         Some("secret-basic-password")
+    );
+}
+
+#[test]
+fn publish_link_sends_access_without_basic_auth_and_prints_share_url() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/link-site/deployments/prepare") => StubResponse::json(&format!(
+                r#"{{"deploymentId":"dep-link","servedUrl":"https://link-site.example.test","shareUrl":"https://link-site.example.test/_cfsurge/share/signed-token","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/link-site/deployments/dep-link/files/index.html"}}]}}"#,
+                api_base
+            )),
+            ("PUT", "/v1/projects/link-site/deployments/dep-link/files/index.html") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("POST", "/v1/projects/link-site/deployments/dep-link/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"link-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"link\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
+    assert_eq!(
+        result.stdout,
+        "published link-site -> https://link-site.example.test\nshare url: https://link-site.example.test/_cfsurge/share/signed-token\n"
+    );
+
+    let requests = server.recorded();
+    let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        prepare_body.get("access").and_then(Value::as_str),
+        Some("link")
+    );
+    assert!(prepare_body.get("basicAuth").is_none());
+    assert!(prepare_body.get("rotateShareLink").is_none());
+}
+
+#[test]
+fn publish_link_without_share_url_prints_only_published_line() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/link-site/deployments/prepare") => StubResponse::json(&format!(
+                r#"{{"deploymentId":"dep-link-no-share","servedUrl":"https://link-site.example.test","shareUrl":null,"uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/link-site/deployments/dep-link-no-share/files/index.html"}}]}}"#,
+                api_base
+            )),
+            ("PUT", "/v1/projects/link-site/deployments/dep-link-no-share/files/index.html") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            ("POST", "/v1/projects/link-site/deployments/dep-link-no-share/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"link-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"link\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+    assert_eq!(result.code, 0, "{}", result.stderr);
+    assert_publish_progress_stderr(&result.stderr, 1, 1);
+    assert_eq!(
+        result.stdout,
+        "published link-site -> https://link-site.example.test\n"
+    );
+}
+
+#[test]
+fn publish_rotate_share_link_sends_rotate_share_link_for_link_access() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/link-site/deployments/prepare") => StubResponse::json(
+                r#"{"deploymentId":"dep-link-rotate","servedUrl":"https://link-site.example.test","shareUrl":"https://link-site.example.test/_cfsurge/share/rotated-token","uploadUrls":[]}"#,
+            ),
+            ("POST", "/v1/projects/link-site/deployments/dep-link-rotate/activate") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"link-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"link\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &["publish", "--rotate-share-link"],
+        &home_envs(&home),
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 0, "{}", result.stderr);
+
+    let requests = server.recorded();
+    let prepare_body: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(
+        prepare_body.get("access").and_then(Value::as_str),
+        Some("link")
+    );
+    assert_eq!(
+        prepare_body.get("rotateShareLink").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[test]
+fn publish_rotate_share_link_rejects_non_link_access() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(|_, _| StubResponse::text(404, "not found"));
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"public-site\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(
+        &["publish", "--rotate-share-link"],
+        &home_envs(&home),
+        "",
+        Some(project.path()),
+    );
+    assert_eq!(result.code, 1);
+    assert_eq!(
+        result.stderr.trim(),
+        "--rotate-share-link is only available when access=link"
     );
 }
 
@@ -2230,7 +2451,7 @@ fn init_rejects_deprecated_visibility_flag() {
     assert_eq!(result.code, 1);
     assert_eq!(
         result.stderr.trim(),
-        "--visibility is no longer supported. Use --access <public|basic>."
+        "--visibility is no longer supported. Use --access <public|basic|link>."
     );
 }
 
@@ -2247,7 +2468,7 @@ fn publish_rejects_deprecated_visibility_flag() {
     assert_eq!(result.code, 1);
     assert_eq!(
         result.stderr.trim(),
-        "--visibility is no longer supported. Use --access <public|basic>."
+        "--visibility is no longer supported. Use --access <public|basic|link>."
     );
 }
 
@@ -2366,7 +2587,7 @@ fn list_prints_access_and_fallbacks() {
     let server = start_stub_server(|_, request| {
         match (request.method.as_str(), request.url.as_str()) {
             ("GET", "/v1/projects") => StubResponse::json(
-                r#"{"projects":[{"slug":"public-site","access":"public","servedUrl":"https://public-site.example.test","publicUrl":"https://public-site.example.test","hostname":"https://public-site.example.test","activeDeploymentId":"dep-1","updatedAt":"2026-03-23T00:00:00.000Z","updatedBy":"cf-token:a"},{"slug":"legacy","publicUrl":"https://legacy.example.test","hostname":"https://legacy.example.test","activeDeploymentId":null,"updatedAt":null,"updatedBy":null}]}"#,
+                r#"{"projects":[{"slug":"public-site","access":"public","servedUrl":"https://public-site.example.test","publicUrl":"https://public-site.example.test","hostname":"https://public-site.example.test","activeDeploymentId":"dep-1","updatedAt":"2026-03-23T00:00:00.000Z","updatedBy":"cf-token:a"},{"slug":"legacy","publicUrl":"https://legacy.example.test","hostname":"https://legacy.example.test","activeDeploymentId":null,"updatedAt":null,"updatedBy":null},{"slug":"link-site","access":"link","servedUrl":"https://link-site.example.test","shareUrl":"https://link-site.example.test/_cfsurge/share/token","activeDeploymentId":"dep-link","updatedAt":"2026-03-23T01:00:00.000Z","updatedBy":"cf-token:b"}]}"#,
             ),
             _ => StubResponse::text(404, "not found"),
         }
@@ -2383,7 +2604,7 @@ fn list_prints_access_and_fallbacks() {
     assert_eq!(result.code, 0, "{}", result.stderr);
     assert_eq!(
         result.stdout,
-        "public-site\tpublic\thttps://public-site.example.test\tdep-1\t2026-03-23T00:00:00.000Z\tcf-token:a\nlegacy\tpublic\thttps://legacy.example.test\t-\t-\t-\n"
+        "public-site\tpublic\thttps://public-site.example.test\tdep-1\t2026-03-23T00:00:00.000Z\tcf-token:a\t-\nlegacy\tpublic\thttps://legacy.example.test\t-\t-\t-\t-\nlink-site\tlink\thttps://link-site.example.test\tdep-link\t2026-03-23T01:00:00.000Z\tcf-token:b\thttps://link-site.example.test/_cfsurge/share/token\n"
     );
 }
 

@@ -101,6 +101,7 @@ struct SiteConfig {
 enum Access {
     Public,
     Basic,
+    Link,
 }
 
 impl Access {
@@ -108,6 +109,7 @@ impl Access {
         match self {
             Self::Public => "public",
             Self::Basic => "basic",
+            Self::Link => "link",
         }
     }
 }
@@ -132,6 +134,7 @@ struct PrepareResponse {
     deployment_id: String,
     served_url: Option<String>,
     public_url: Option<String>,
+    share_url: Option<String>,
     upload_urls: Vec<UploadUrl>,
 }
 
@@ -369,6 +372,7 @@ struct ProjectRecord {
     access: Option<String>,
     served_url: Option<String>,
     public_url: Option<String>,
+    share_url: Option<String>,
     active_deployment_id: Option<String>,
     updated_at: Option<String>,
     updated_by: Option<String>,
@@ -580,6 +584,7 @@ fn publish(args: &[String]) -> Result<(), String> {
         .as_ref()
         .map(|item| item.access)
         .unwrap_or(DEFAULT_ACCESS);
+    let rotate_share_link = has_flag(args, "--rotate-share-link");
 
     let slug = slug.ok_or_else(|| {
         format!(
@@ -591,6 +596,9 @@ fn publish(args: &[String]) -> Result<(), String> {
             "usage: cfsurge publish [dir] [--slug <slug>] (or configure {SITE_CONFIG_FILE_NAME} via cfsurge init)"
         )
     })?;
+    if rotate_share_link && access != Access::Link {
+        return Err("--rotate-share-link is only available when access=link".into());
+    }
 
     let config = read_config(ReadConfigOptions::default())?;
     let reserved_labels = build_reserved_labels(Some(config.api_base.as_str()), None);
@@ -603,7 +611,7 @@ fn publish(args: &[String]) -> Result<(), String> {
 
     let absolute_dir = fs::canonicalize(&directory).map_err(|error| error.to_string())?;
     let mut progress = PublishProgressReporter::new(io::stderr().is_terminal());
-    let publish_result = (|| -> Result<String, String> {
+    let publish_result = (|| -> Result<(String, Option<String>), String> {
         progress.update(PublishProgressState::initial());
 
         let mut last_scanning_percent = None;
@@ -640,17 +648,27 @@ fn publish(args: &[String]) -> Result<(), String> {
             total_files: files.len(),
         });
 
-        let prepare_body = if let Some(basic_auth) = basic_auth.as_ref() {
-            serde_json::json!({
+        let prepare_body = match (basic_auth.as_ref(), rotate_share_link) {
+            (Some(value), true) => serde_json::json!({
                 "files": files,
                 "access": access.as_str(),
-                "basicAuth": basic_auth,
-            })
-        } else {
-            serde_json::json!({
+                "basicAuth": value,
+                "rotateShareLink": true,
+            }),
+            (Some(value), false) => serde_json::json!({
                 "files": files,
                 "access": access.as_str(),
-            })
+                "basicAuth": value,
+            }),
+            (None, true) => serde_json::json!({
+                "files": files,
+                "access": access.as_str(),
+                "rotateShareLink": true,
+            }),
+            (None, false) => serde_json::json!({
+                "files": files,
+                "access": access.as_str(),
+            }),
         };
 
         let client = Client::new();
@@ -745,6 +763,7 @@ fn publish(args: &[String]) -> Result<(), String> {
         let served_url = read_string_opt(prepared.served_url.as_ref())
             .or_else(|| read_string_opt(prepared.public_url.as_ref()))
             .ok_or_else(|| "prepare failed: missing servedUrl/publicUrl in response".to_string())?;
+        let share_url = read_string_opt(prepared.share_url.as_ref());
         progress.update(PublishProgressState {
             phase: PublishProgressPhase::Complete,
             completed_uploads,
@@ -752,12 +771,15 @@ fn publish(args: &[String]) -> Result<(), String> {
             scanned_files: files.len(),
             total_files: files.len(),
         });
-        Ok(served_url)
+        Ok((served_url, share_url))
     })();
     progress.stop();
 
-    let served_url = publish_result?;
+    let (served_url, share_url) = publish_result?;
     println!("published {slug} -> {served_url}");
+    if let Some(value) = share_url {
+        println!("share url: {value}");
+    }
     Ok(())
 }
 
@@ -791,14 +813,16 @@ fn list_projects() -> Result<(), String> {
             .or_else(|| read_string_opt(project.public_url.as_ref()))
             .or_else(|| read_string_opt(project.hostname.as_ref()))
             .unwrap_or_else(|| "-".into());
+        let share_url = read_string_opt(project.share_url.as_ref()).unwrap_or_else(|| "-".into());
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             project.slug,
             access.as_str(),
             served_url,
             project.active_deployment_id.unwrap_or_else(|| "-".into()),
             project.updated_at.unwrap_or_else(|| "-".into()),
-            project.updated_by.unwrap_or_else(|| "-".into())
+            project.updated_by.unwrap_or_else(|| "-".into()),
+            share_url
         );
     }
 
@@ -1901,6 +1925,11 @@ fn resolve_access(args: &[String], default_access: Access) -> Result<Access, Str
                 label: "basic",
                 description: "Published at the same URL with HTTP Basic authentication",
             },
+            SelectOption {
+                value: Access::Link,
+                label: "link",
+                description: "Published at the same URL with one-click share URL",
+            },
         ],
         default_access,
     )
@@ -1959,6 +1988,7 @@ fn normalize_access(value: Option<&str>) -> Option<Access> {
     match normalized.as_str() {
         "public" => Some(Access::Public),
         "basic" => Some(Access::Basic),
+        "link" => Some(Access::Link),
         _ => None,
     }
 }
@@ -1973,12 +2003,13 @@ fn normalize_legacy_visibility(value: Option<&str>) -> Option<LegacyVisibility> 
 }
 
 fn parse_access_input(value: &str) -> Result<Access, String> {
-    normalize_access(Some(value)).ok_or_else(|| "invalid access: expected public or basic".into())
+    normalize_access(Some(value))
+        .ok_or_else(|| "invalid access: expected public, basic, or link".into())
 }
 
 fn assert_no_deprecated_visibility_flag(args: &[String]) -> Result<(), String> {
     if args.iter().any(|value| value == "--visibility") {
-        Err("--visibility is no longer supported. Use --access <public|basic>.".into())
+        Err("--visibility is no longer supported. Use --access <public|basic|link>.".into())
     } else {
         Ok(())
     }
@@ -2611,7 +2642,7 @@ fn read_stdin_line() -> Result<String, String> {
 
 fn print_help() {
     print!(
-        "cfsurge commands:\n  login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--new-password <password>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--access <public|basic>]\n  publish [dir] [--slug <slug>]\n  --version\n  list\n  remove [slug]\n  passwd [--current-password <password>] [--new-password <password>]\n  admin users list\n  admin users create --username <username> [--role <user|admin>] [--temporary-password <password>]\n  admin users reset-password <username>\n  admin users disable <username>\n  admin users enable <username>\n  logout\n  interactive choices: use ↑/↓ and Enter\n"
+        "cfsurge commands:\n  login [--api-base <url>] [--auth <service-session|cloudflare-admin>] [--username <username>] [--password <password>] [--new-password <password>] [--token <token>] [--token-storage <file|keychain>]\n  init [--api-base <url>] [--slug <slug>] [--publish-dir <dir>] [--access <public|basic|link>]\n  publish [dir] [--slug <slug>] [--rotate-share-link]\n  --version\n  list\n  remove [slug]\n  passwd [--current-password <password>] [--new-password <password>]\n  admin users list\n  admin users create --username <username> [--role <user|admin>] [--temporary-password <password>]\n  admin users reset-password <username>\n  admin users disable <username>\n  admin users enable <username>\n  logout\n  interactive choices: use ↑/↓ and Enter\n"
     );
 }
 
@@ -2632,6 +2663,10 @@ fn read_flag(args: &[String], flag: &str) -> Option<String> {
         .position(|value| value == flag)
         .and_then(|index| args.get(index + 1))
         .cloned()
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|value| value == flag)
 }
 
 fn read_positional_arg(args: &[String]) -> Option<String> {
@@ -2707,9 +2742,9 @@ fn format_http_error(error: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiMetadata, AuthType, FALLBACK_API_RESERVED_LABEL, assert_valid_slug,
-        build_reserved_labels, normalize_api_base, parse_login_mode_input, parse_publish_dir_input,
-        parse_user_role,
+        Access, ApiMetadata, AuthType, FALLBACK_API_RESERVED_LABEL, assert_valid_slug,
+        build_reserved_labels, normalize_access, normalize_api_base, parse_access_input,
+        parse_login_mode_input, parse_publish_dir_input, parse_user_role,
     };
 
     #[test]
@@ -2791,5 +2826,18 @@ mod tests {
     fn parse_user_role_rejects_unknown_role() {
         let error = parse_user_role("owner").expect_err("unknown role must fail");
         assert_eq!(error, "invalid role: expected user or admin");
+    }
+
+    #[test]
+    fn normalize_access_accepts_link() {
+        assert_eq!(normalize_access(Some("link")), Some(Access::Link));
+    }
+
+    #[test]
+    fn parse_access_input_accepts_link() {
+        assert_eq!(
+            parse_access_input("link").expect("link access"),
+            Access::Link
+        );
     }
 }

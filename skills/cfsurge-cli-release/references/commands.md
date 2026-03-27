@@ -66,11 +66,14 @@ Expand-Archive .\cfsurge-windows-x64.zip -DestinationPath .
 - `--new-password` is rejected for `cloudflare-admin` login.
 - `init` writes `.cfsurge.json` in the current directory and stores `slug`, `publishDir`, and `access`.
 - `init --access basic` can be used for Basic-auth protected publishing on the same slug subdomain.
+- `init --access link` can be used for share-link protected publishing on the same slug subdomain.
 - `publish` uses the positional directory argument first, then the `publishDir` field in `.cfsurge.json`.
 - `publish` uses `--slug` first, then the `slug` field in `.cfsurge.json`.
-- `publish` uses the `access` field in `.cfsurge.json` to choose `public` or `basic`.
+- `publish` uses the `access` field in `.cfsurge.json` to choose `public`, `basic`, or `link`.
 - `publish` with `access=basic` requires `CFSURGE_BASIC_AUTH_USERNAME` and `CFSURGE_BASIC_AUTH_PASSWORD`.
+- `publish --rotate-share-link` is only valid when `access=link`.
+- `publish` may print `share url: ...` after `published ...` when the API returns `shareUrl`.
 - `remove` uses the positional slug first, then the `slug` field in `.cfsurge.json`.
-- `list` prints TSV columns: `slug`, `access`, `servedUrl`, `activeDeploymentId`, `updatedAt`, `updatedBy`.
+- `list` prints TSV columns: `slug`, `access`, `servedUrl`, `activeDeploymentId`, `updatedAt`, `updatedBy`, `shareUrl`.
 - `passwd` is available only for `service-session` logins and auto re-logs in on success.
 - `admin users` supports `list`, `create`, `reset-password`, `disable`, and `enable`.
