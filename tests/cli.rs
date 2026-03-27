@@ -1356,7 +1356,7 @@ fn publish_uses_site_config_defaults() {
                 StubResponse::json(r#"{"ok":true}"#)
             }
             ("POST", "/v1/projects/site-default/deployments/dep-1/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(r#"{"ok":true,"servedUrl":"https://site-default.example.test"}"#)
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -1417,7 +1417,9 @@ fn publish_explicit_args_override_site_config() {
                 StubResponse::json(r#"{"ok":true}"#)
             }
             ("POST", "/v1/projects/slug-override/deployments/dep-2/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(
+                    r#"{"ok":true,"servedUrl":"https://slug-override.example.test"}"#,
+                )
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -1483,7 +1485,7 @@ fn publish_reports_progress_for_multiple_uploads() {
                 StubResponse::json(r#"{"ok":true}"#)
             }
             ("POST", "/v1/projects/multi-upload/deployments/dep-multi/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(r#"{"ok":true,"servedUrl":"https://multi-upload.example.test"}"#)
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -1528,7 +1530,7 @@ fn publish_reports_progress_when_prepare_returns_zero_uploads() {
                 r#"{"deploymentId":"dep-no-upload","publicUrl":"https://no-upload.example.test","uploadUrls":[]}"#,
             ),
             ("POST", "/v1/projects/no-upload/deployments/dep-no-upload/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(r#"{"ok":true,"servedUrl":"https://no-upload.example.test"}"#)
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -1675,7 +1677,7 @@ fn publish_basic_sends_basic_auth_and_prints_served_url() {
                 StubResponse::json(r#"{"ok":true}"#)
             }
             ("POST", "/v1/projects/private-site/deployments/dep-basic/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(r#"{"ok":true,"servedUrl":"https://private-site.example.test"}"#)
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -1747,15 +1749,15 @@ fn publish_link_sends_access_without_basic_auth_and_prints_share_url() {
     let server = start_stub_server(move |api_base, request| {
         match (request.method.as_str(), request.url.as_str()) {
             ("POST", "/v1/projects/link-site/deployments/prepare") => StubResponse::json(&format!(
-                r#"{{"deploymentId":"dep-link","servedUrl":"https://link-site.example.test","shareUrl":"https://link-site.example.test/_cfsurge/share/signed-token","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/link-site/deployments/dep-link/files/index.html"}}]}}"#,
+                r#"{{"deploymentId":"dep-link","servedUrl":"https://preview-link-site.example.test","shareUrl":"https://preview-link-site.example.test/_cfsurge/share/preview-token","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/link-site/deployments/dep-link/files/index.html"}}]}}"#,
                 api_base
             )),
             ("PUT", "/v1/projects/link-site/deployments/dep-link/files/index.html") => {
                 StubResponse::json(r#"{"ok":true}"#)
             }
-            ("POST", "/v1/projects/link-site/deployments/dep-link/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
-            }
+            ("POST", "/v1/projects/link-site/deployments/dep-link/activate") => StubResponse::json(
+                r#"{"ok":true,"servedUrl":"https://link-site.example.test","shareUrl":"https://link-site.example.test/_cfsurge/share/signed-token"}"#,
+            ),
             _ => StubResponse::text(404, "not found"),
         }
     });
@@ -1806,7 +1808,9 @@ fn publish_link_without_share_url_prints_only_published_line() {
                 StubResponse::json(r#"{"ok":true}"#)
             }
             ("POST", "/v1/projects/link-site/deployments/dep-link-no-share/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(
+                    r#"{"ok":true,"servedUrl":"https://link-site.example.test","shareUrl":null}"#,
+                )
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -1845,7 +1849,9 @@ fn publish_rotate_share_link_sends_rotate_share_link_for_link_access() {
                 r#"{"deploymentId":"dep-link-rotate","servedUrl":"https://link-site.example.test","shareUrl":"https://link-site.example.test/_cfsurge/share/rotated-token","uploadUrls":[]}"#,
             ),
             ("POST", "/v1/projects/link-site/deployments/dep-link-rotate/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(
+                    r#"{"ok":true,"servedUrl":"https://link-site.example.test","shareUrl":"https://link-site.example.test/_cfsurge/share/rotated-token"}"#,
+                )
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -1882,6 +1888,48 @@ fn publish_rotate_share_link_sends_rotate_share_link_for_link_access() {
     assert_eq!(
         prepare_body.get("rotateShareLink").and_then(Value::as_bool),
         Some(true)
+    );
+}
+
+#[test]
+fn publish_fails_when_activate_response_is_missing_final_url() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/missing-final-url/deployments/prepare") => StubResponse::json(
+                r#"{"deploymentId":"dep-missing-final-url","servedUrl":"https://preview.example.test","uploadUrls":[]}"#,
+            ),
+            (
+                "POST",
+                "/v1/projects/missing-final-url/deployments/dep-missing-final-url/activate",
+            ) => StubResponse::json(
+                r#"{"ok":true,"shareUrl":"https://missing-final-url.example.test/_cfsurge/share/token"}"#,
+            ),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"missing-final-url\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+    assert_eq!(result.code, 1);
+    assert!(
+        result
+            .stderr
+            .contains("activate failed: missing servedUrl/publicUrl in response")
     );
 }
 
@@ -1934,7 +1982,7 @@ fn publish_basic_uses_cwd_dotenv_credentials() {
                 StubResponse::json(r#"{"ok":true}"#)
             }
             ("POST", "/v1/projects/private-site/deployments/dep-basic-dotenv/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(r#"{"ok":true,"servedUrl":"https://private-site.example.test"}"#)
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -2006,7 +2054,7 @@ fn publish_basic_prefers_process_env_over_conflicting_dotenv_values() {
                 "/v1/projects/private-site/deployments/dep-basic-env-precedence/files/index.html",
             ) => StubResponse::json(r#"{"ok":true}"#),
             ("POST", "/v1/projects/private-site/deployments/dep-basic-env-precedence/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(r#"{"ok":true,"servedUrl":"https://private-site.example.test"}"#)
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -2086,7 +2134,9 @@ fn publish_basic_succeeds_with_env_only_credentials_when_cwd_dotenv_is_unreadabl
             (
                 "POST",
                 "/v1/projects/private-site/deployments/dep-basic-unreadable-dotenv/activate",
-            ) => StubResponse::json(r#"{"ok":true}"#),
+            ) => {
+                StubResponse::json(r#"{"ok":true,"servedUrl":"https://private-site.example.test"}"#)
+            }
             _ => StubResponse::text(404, "not found"),
         }
     });
@@ -2164,7 +2214,7 @@ fn publish_basic_allows_mixed_process_env_and_dotenv_sources() {
                 StubResponse::json(r#"{"ok":true}"#)
             }
             ("POST", "/v1/projects/private-site/deployments/dep-basic-mixed/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(r#"{"ok":true,"servedUrl":"https://private-site.example.test"}"#)
             }
             _ => StubResponse::text(404, "not found"),
         }
@@ -2368,7 +2418,7 @@ fn publish_accepts_legacy_visibility_public_site_config() {
                 StubResponse::json(r#"{"ok":true}"#)
             }
             ("POST", "/v1/projects/site-default/deployments/dep-legacy-public/activate") => {
-                StubResponse::json(r#"{"ok":true}"#)
+                StubResponse::json(r#"{"ok":true,"servedUrl":"https://site-default.example.test"}"#)
             }
             _ => StubResponse::text(404, "not found"),
         }

@@ -112,7 +112,7 @@ cfsurge publish --rotate-share-link
 
 `publish` の進捗は `stderr` に出力されます。TTY ではスピナー付きで 1 行更新、非 TTY では改行付きログとして出力されます。  
 成功時の最終行 `published <slug> -> <url>` は `stdout` に出力されます。
-`prepare` が `shareUrl` を返した場合は、続けて `share url: <url>` 行を `stdout` に出力します。
+`activate` の最終応答に `shareUrl` が含まれる場合は、続けて `share url: <url>` 行を `stdout` に出力します。
 
 `access=basic` の場合は `publish` 実行時に毎回、次の環境変数が必須です。
 

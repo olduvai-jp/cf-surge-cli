@@ -132,9 +132,6 @@ struct ApiMetadata {
 #[serde(rename_all = "camelCase")]
 struct PrepareResponse {
     deployment_id: String,
-    served_url: Option<String>,
-    public_url: Option<String>,
-    share_url: Option<String>,
     upload_urls: Vec<UploadUrl>,
 }
 
@@ -142,6 +139,14 @@ struct PrepareResponse {
 struct UploadUrl {
     path: String,
     url: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivateResponse {
+    served_url: Option<String>,
+    public_url: Option<String>,
+    share_url: Option<String>,
 }
 
 struct SelectOption<T> {
@@ -760,10 +765,15 @@ fn publish(args: &[String]) -> Result<(), String> {
             ));
         }
 
-        let served_url = read_string_opt(prepared.served_url.as_ref())
-            .or_else(|| read_string_opt(prepared.public_url.as_ref()))
-            .ok_or_else(|| "prepare failed: missing servedUrl/publicUrl in response".to_string())?;
-        let share_url = read_string_opt(prepared.share_url.as_ref());
+        let activated = activate_response
+            .json::<ActivateResponse>()
+            .map_err(format_http_error)?;
+        let served_url = read_string_opt(activated.served_url.as_ref())
+            .or_else(|| read_string_opt(activated.public_url.as_ref()))
+            .ok_or_else(|| {
+                "activate failed: missing servedUrl/publicUrl in response".to_string()
+            })?;
+        let share_url = read_string_opt(activated.share_url.as_ref());
         progress.update(PublishProgressState {
             phase: PublishProgressPhase::Complete,
             completed_uploads,
