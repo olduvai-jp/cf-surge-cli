@@ -1399,6 +1399,11 @@ fn publish_uses_site_config_defaults() {
         requests[1].content_type.as_deref(),
         Some("text/html; charset=utf-8")
     );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.url.ends_with("/cancel"))
+    );
 }
 
 #[test]
@@ -1585,6 +1590,9 @@ fn publish_upload_failure_includes_progress_and_error() {
             ("PUT", "/v1/projects/failing-upload/deployments/dep-fail/files/index.html") => {
                 StubResponse::text(500, "upload-broken")
             }
+            ("POST", "/v1/projects/failing-upload/deployments/dep-fail/cancel") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
             ("POST", "/v1/projects/failing-upload/deployments/dep-fail/activate") => {
                 StubResponse::json(r#"{"ok":true}"#)
             }
@@ -1623,6 +1631,11 @@ fn publish_upload_failure_includes_progress_and_error() {
             .stderr
             .contains("upload failed for index.html: upload-broken")
     );
+    assert!(
+        !result
+            .stderr
+            .contains("warning: failed to cancel upload session")
+    );
     assert!(result.stderr.ends_with('\n'));
 
     let requests = server.recorded();
@@ -1631,6 +1644,223 @@ fn publish_upload_failure_includes_progress_and_error() {
             .iter()
             .all(|request| request.url
                 != "/v1/projects/failing-upload/deployments/dep-fail/activate")
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(
+                |request| request.url == "/v1/projects/failing-upload/deployments/dep-fail/cancel"
+            )
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn publish_upload_failure_preserves_original_error_when_cancel_fails() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/cancel-fails/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-cancel-fail","uploadUrls":[{{"path":"index.html","url":"{}/v1/projects/cancel-fails/deployments/dep-cancel-fail/files/index.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            ("PUT", "/v1/projects/cancel-fails/deployments/dep-cancel-fail/files/index.html") => {
+                StubResponse::text(500, "upload-original")
+            }
+            ("POST", "/v1/projects/cancel-fails/deployments/dep-cancel-fail/cancel") => {
+                StubResponse::text(500, "cancel-broken")
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"cancel-fails\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+
+    assert_eq!(result.code, 1);
+    assert!(
+        result
+            .stderr
+            .contains("upload failed for index.html: upload-original")
+    );
+    assert!(
+        result
+            .stderr
+            .contains("warning: failed to cancel upload session (500 cancel-broken)")
+    );
+
+    let requests = server.recorded();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url
+                == "/v1/projects/cancel-fails/deployments/dep-cancel-fail/cancel")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn publish_activate_failure_sends_cancel_and_preserves_activate_error() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/activate-fails/deployments/prepare") => {
+                StubResponse::json(r#"{"deploymentId":"dep-activate-fails","uploadUrls":[]}"#)
+            }
+            ("POST", "/v1/projects/activate-fails/deployments/dep-activate-fails/activate") => {
+                StubResponse::text(409, "activate-original")
+            }
+            ("POST", "/v1/projects/activate-fails/deployments/dep-activate-fails/cancel") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"activate-fails\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+
+    assert_eq!(result.code, 1);
+    assert!(result.stderr.contains("activate failed: activate-original"));
+    assert!(
+        !result
+            .stderr
+            .contains("warning: failed to cancel upload session")
+    );
+
+    let requests = server.recorded();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url
+                == "/v1/projects/activate-fails/deployments/dep-activate-fails/cancel")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn publish_prepare_failure_does_not_send_cancel() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |_, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/prepare-fails/deployments/prepare") => {
+                StubResponse::text(409, "prepare-original")
+            }
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"prepare-fails\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+
+    assert_eq!(result.code, 1);
+    assert!(result.stderr.contains("prepare failed: prepare-original"));
+    assert!(
+        server
+            .recorded()
+            .iter()
+            .all(|request| !request.url.ends_with("/cancel"))
+    );
+}
+
+#[test]
+fn publish_missing_file_descriptor_sends_cancel() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let server = start_stub_server(move |api_base, request| {
+        match (request.method.as_str(), request.url.as_str()) {
+            ("POST", "/v1/projects/missing-descriptor/deployments/prepare") => {
+                StubResponse::json(&format!(
+                    r#"{{"deploymentId":"dep-missing-descriptor","uploadUrls":[{{"path":"missing.html","url":"{}/v1/projects/missing-descriptor/deployments/dep-missing-descriptor/files/missing.html"}}]}}"#,
+                    api_base
+                ))
+            }
+            (
+                "POST",
+                "/v1/projects/missing-descriptor/deployments/dep-missing-descriptor/cancel",
+            ) => StubResponse::json(r#"{"ok":true}"#),
+            _ => StubResponse::text(404, "not found"),
+        }
+    });
+
+    write_config(
+        home.path(),
+        &format!(
+            "{{\n  \"apiBase\": \"{}\",\n  \"tokenStorage\": \"file\",\n  \"token\": \"token-publish\"\n}}\n",
+            server.api_base
+        ),
+    );
+    create_site_directory(project.path(), "public");
+    fs::write(
+        site_config_path_for_dir(project.path()),
+        "{\n  \"slug\": \"missing-descriptor\",\n  \"publishDir\": \"public\",\n  \"access\": \"public\"\n}\n",
+    )
+    .unwrap();
+
+    let result = run_cli(&["publish"], &home_envs(&home), "", Some(project.path()));
+
+    assert_eq!(result.code, 1);
+    assert!(
+        result
+            .stderr
+            .contains("missing file descriptor for missing.html")
+    );
+
+    let requests = server.recorded();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url
+                == "/v1/projects/missing-descriptor/deployments/dep-missing-descriptor/cancel")
+            .count(),
+        1
     );
 }
 
@@ -1906,6 +2136,9 @@ fn publish_fails_when_activate_response_is_missing_final_url() {
             ) => StubResponse::json(
                 r#"{"ok":true,"shareUrl":"https://missing-final-url.example.test/_cfsurge/share/token"}"#,
             ),
+            ("POST", "/v1/projects/missing-final-url/deployments/dep-missing-final-url/cancel") => {
+                StubResponse::json(r#"{"ok":true}"#)
+            }
             _ => StubResponse::text(404, "not found"),
         }
     });
@@ -1930,6 +2163,16 @@ fn publish_fails_when_activate_response_is_missing_final_url() {
         result
             .stderr
             .contains("activate failed: missing servedUrl/publicUrl in response")
+    );
+
+    let requests = server.recorded();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url
+                == "/v1/projects/missing-final-url/deployments/dep-missing-final-url/cancel")
+            .count(),
+        1
     );
 }
 

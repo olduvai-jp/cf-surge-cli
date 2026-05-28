@@ -8,6 +8,8 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -390,6 +392,16 @@ struct BasicAuthPayload {
     password: String,
 }
 
+#[derive(Clone, Debug)]
+struct PublishCancelState {
+    api_base: String,
+    token: String,
+    slug: String,
+    deployment_id: Option<String>,
+    activated: bool,
+    cancel_attempted: bool,
+}
+
 pub fn run() -> Result<(), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     run_with_args(args)
@@ -615,6 +627,25 @@ fn publish(args: &[String]) -> Result<(), String> {
     };
 
     let absolute_dir = fs::canonicalize(&directory).map_err(|error| error.to_string())?;
+    let cancel_state = Arc::new(Mutex::new(PublishCancelState {
+        api_base: config.api_base.clone(),
+        token: config.token.clone(),
+        slug: slug.clone(),
+        deployment_id: None,
+        activated: false,
+        cancel_attempted: false,
+    }));
+    let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|error| error.to_string())?;
+    let signal_handle = signals.handle();
+    let signal_cancel_state = Arc::clone(&cancel_state);
+    let signal_thread = thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            if let Some(warning) = cancel_prepared_once(&signal_cancel_state) {
+                eprintln!("{warning}");
+            }
+            std::process::exit(128 + signal);
+        }
+    });
     let mut progress = PublishProgressReporter::new(io::stderr().is_terminal());
     let publish_result = (|| -> Result<(String, Option<String>), String> {
         progress.update(PublishProgressState::initial());
@@ -698,6 +729,9 @@ fn publish(args: &[String]) -> Result<(), String> {
         let prepared = prepare_response
             .json::<PrepareResponse>()
             .map_err(format_http_error)?;
+        if let Ok(mut state) = cancel_state.lock() {
+            state.deployment_id = Some(prepared.deployment_id.clone());
+        }
         let total_uploads = prepared.upload_urls.len();
         let mut completed_uploads = 0usize;
 
@@ -774,6 +808,9 @@ fn publish(args: &[String]) -> Result<(), String> {
                 "activate failed: missing servedUrl/publicUrl in response".to_string()
             })?;
         let share_url = read_string_opt(activated.share_url.as_ref());
+        if let Ok(mut state) = cancel_state.lock() {
+            state.activated = true;
+        }
         progress.update(PublishProgressState {
             phase: PublishProgressPhase::Complete,
             completed_uploads,
@@ -784,12 +821,67 @@ fn publish(args: &[String]) -> Result<(), String> {
         Ok((served_url, share_url))
     })();
     progress.stop();
+    if publish_result.is_err()
+        && let Some(warning) = cancel_prepared_once(&cancel_state)
+    {
+        eprintln!("{warning}");
+    }
+    signal_handle.close();
+    let _ = signal_thread.join();
 
     let (served_url, share_url) = publish_result?;
     println!("published {slug} -> {served_url}");
     if let Some(value) = share_url {
         println!("share url: {value}");
     }
+    Ok(())
+}
+
+fn cancel_prepared_once(cancel_state: &Arc<Mutex<PublishCancelState>>) -> Option<String> {
+    let (api_base, token, slug, deployment_id) = {
+        let mut state = cancel_state.lock().ok()?;
+        if state.activated || state.cancel_attempted {
+            return None;
+        }
+        let deployment_id = state.deployment_id.clone()?;
+        state.cancel_attempted = true;
+        (
+            state.api_base.clone(),
+            state.token.clone(),
+            state.slug.clone(),
+            deployment_id,
+        )
+    };
+
+    cancel_prepared_deployment(&api_base, &token, &slug, &deployment_id)
+        .err()
+        .map(|error| format!("warning: failed to cancel upload session ({error})"))
+}
+
+fn cancel_prepared_deployment(
+    api_base: &str,
+    token: &str,
+    slug: &str,
+    deployment_id: &str,
+) -> Result<(), String> {
+    let client = Client::new();
+    let response = client
+        .post(format!(
+            "{}/v1/projects/{}/deployments/{}/cancel",
+            api_base,
+            encode(slug),
+            encode(deployment_id)
+        ))
+        .headers(auth_headers(token)?)
+        .send()
+        .map_err(format_http_error)?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        return Err(format!("{status} {body}"));
+    }
+
     Ok(())
 }
 
