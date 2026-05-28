@@ -8,8 +8,10 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(not(windows))]
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
+#[cfg(not(windows))]
+use signal_hook::iterator::{Handle as SignalHandle, Signals};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -635,17 +637,8 @@ fn publish(args: &[String]) -> Result<(), String> {
         activated: false,
         cancel_attempted: false,
     }));
-    let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|error| error.to_string())?;
-    let signal_handle = signals.handle();
-    let signal_cancel_state = Arc::clone(&cancel_state);
-    let signal_thread = thread::spawn(move || {
-        if let Some(signal) = signals.forever().next() {
-            if let Some(warning) = cancel_prepared_once(&signal_cancel_state) {
-                eprintln!("{warning}");
-            }
-            std::process::exit(128 + signal);
-        }
-    });
+    #[cfg(not(windows))]
+    let (signal_handle, signal_thread) = start_publish_signal_listener(&cancel_state)?;
     let mut progress = PublishProgressReporter::new(io::stderr().is_terminal());
     let publish_result = (|| -> Result<(String, Option<String>), String> {
         progress.update(PublishProgressState::initial());
@@ -826,8 +819,11 @@ fn publish(args: &[String]) -> Result<(), String> {
     {
         eprintln!("{warning}");
     }
-    signal_handle.close();
-    let _ = signal_thread.join();
+    #[cfg(not(windows))]
+    {
+        signal_handle.close();
+        let _ = signal_thread.join();
+    }
 
     let (served_url, share_url) = publish_result?;
     println!("published {slug} -> {served_url}");
@@ -856,6 +852,24 @@ fn cancel_prepared_once(cancel_state: &Arc<Mutex<PublishCancelState>>) -> Option
     cancel_prepared_deployment(&api_base, &token, &slug, &deployment_id)
         .err()
         .map(|error| format!("warning: failed to cancel upload session ({error})"))
+}
+
+#[cfg(not(windows))]
+fn start_publish_signal_listener(
+    cancel_state: &Arc<Mutex<PublishCancelState>>,
+) -> Result<(SignalHandle, thread::JoinHandle<()>), String> {
+    let mut signals = Signals::new([SIGINT, SIGTERM]).map_err(|error| error.to_string())?;
+    let signal_handle = signals.handle();
+    let signal_cancel_state = Arc::clone(cancel_state);
+    let signal_thread = thread::spawn(move || {
+        if let Some(signal) = signals.forever().next() {
+            if let Some(warning) = cancel_prepared_once(&signal_cancel_state) {
+                eprintln!("{warning}");
+            }
+            std::process::exit(128 + signal);
+        }
+    });
+    Ok((signal_handle, signal_thread))
 }
 
 fn cancel_prepared_deployment(
